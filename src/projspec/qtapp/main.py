@@ -27,11 +27,11 @@ from projspec.library import ProjectLibrary
 from projspec.utils import class_infos
 
 try:
-    from PyQt5.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
-    from PyQt5.QtGui import QIcon
-    from PyQt5.QtWebChannel import QWebChannel
-    from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
-    from PyQt5.QtWidgets import (
+    from PySide6.QtCore import QObject, QUrl, Signal, Slot
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWebChannel import QWebChannel
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWidgets import (
         QApplication,
         QFileDialog,
         QMainWindow,
@@ -41,13 +41,16 @@ try:
     )
 
     qt = True
-except ImportError:
+except ImportError as e:
     # fallbacks to make this module importable and give a decent message
+    import traceback
+
     QObject = object
     QMainWindow = object
-    pyqtSignal = lambda *_: None
-    pyqtSlot = lambda *_: lambda *_: None
-    warnings.warn("PyQt5 not installed", ImportWarning)
+    Signal = lambda *_: None
+    Slot = lambda *_: lambda *_: None
+    print("Failed to import PySide6")
+    traceback.print_exc()
     qt = False
 
 from projspec.qtapp.views import get_panel_html
@@ -75,7 +78,7 @@ class JsBridge(QObject):
     slot dispatches on ``type``.
     """
 
-    from_python = pyqtSignal(str)  # JSON-encoded outbound message
+    from_python = Signal(str)  # JSON-encoded outbound message
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -84,7 +87,7 @@ class JsBridge(QObject):
     def set_handler(self, handler) -> None:
         self._handler = handler
 
-    @pyqtSlot(str)
+    @Slot(str)
     def handleMessage(self, message: str) -> None:
         try:
             data = json.loads(message)
@@ -117,38 +120,12 @@ class ProjspecWindow(QMainWindow):
         channel.registerObject("bridge", self._bridge)
         self._view.page().setWebChannel(channel)
 
-        # Qt WebEngine's default settings block a ``file://`` page from
-        # loading webfonts referenced by ``data:`` URIs in its CSS.
-        # Flipping these three switches tells Chromium to treat the page
-        # the same way it would an HTTP page so ``@font-face`` resolves.
-        settings = self._view.settings()
-        for attr in (
-            "LocalContentCanAccessRemoteUrls",
-            "LocalContentCanAccessFileUrls",
-            "ErrorPageEnabled",
-        ):
-            constant = getattr(
-                QWebEngineSettings.WebAttribute
-                if hasattr(QWebEngineSettings, "WebAttribute")
-                else QWebEngineSettings,
-                attr,
-                None,
-            )
-            if constant is not None:
-                settings.setAttribute(constant, True)
-
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._view)
         self.setCentralWidget(central)
 
-        # Load the shared HTML UI.  We write to a temp file and ``setUrl``
-        # it rather than calling ``setHtml``: the latter gives the page an
-        # opaque origin that Chromium treats like a cross-origin document,
-        # breaking anything that touches the page origin (external links,
-        # relative anchors, future ``fetch`` calls).  Loading from a real
-        # ``file://`` URL sidesteps all of that.
         import tempfile
 
         tmp = tempfile.NamedTemporaryFile(
@@ -381,7 +358,7 @@ class ProjspecWindow(QMainWindow):
             return
         target = matches[0]
         if len(matches) > 1:
-            from PyQt5.QtWidgets import QInputDialog
+            from PySide6.QtWidgets import QInputDialog
 
             pick, ok = QInputDialog.getItem(
                 self,
