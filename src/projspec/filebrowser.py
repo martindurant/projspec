@@ -293,15 +293,22 @@ def inspect_file(
         intake_summary = _intake_inspect(url, path, storage_options)
         text_preview = None
 
-        # Always show a text preview for text-like files.
-        is_text = mime and (mime.startswith("text/") or mime in _TEXT_MIMES)
-        if is_text:
+        # Always show a text preview when the file looks like text.
+        # We check the extension exhaustively rather than relying on MIME alone
+        # (many text formats have no registered MIME type or get None from
+        # mimetypes.guess_type).  We then attempt strict UTF-8 decoding and
+        # silently skip the preview if the bytes aren't valid UTF-8 — this
+        # naturally rejects binary files with innocent-looking extensions.
+        if _looks_like_text(path):
             try:
                 with fs.open(path, "rb") as f:
                     raw_bytes = f.read(max_text_bytes)
-                text_preview = raw_bytes.decode("utf-8", errors="replace")
+                # strict=True: raises UnicodeDecodeError on invalid UTF-8
+                text_preview = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text_preview = None  # binary content — skip preview
             except Exception:
-                pass
+                text_preview = None  # IO or other error
 
         return {
             "url": url,
@@ -429,13 +436,240 @@ def _intake_inspect(
     return result if result else None
 
 
-_TEXT_MIMES = {
-    "application/json",
-    "application/x-yaml",
-    "application/toml",
-    "application/javascript",
-    "application/xml",
-}
+# Extensions we treat as text for the purposes of showing a preview.
+# Organised by category; err on the side of inclusion — the UTF-8
+# strict-decode in inspect_file will silently reject anything that
+# turns out to be binary.
+_TEXT_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        # ── source code ──────────────────────────────────────────────────────
+        "py",
+        "pyi",
+        "pyx",
+        "pxd",  # Python
+        "js",
+        "mjs",
+        "cjs",
+        "jsx",  # JavaScript
+        "ts",
+        "tsx",
+        "d.ts",  # TypeScript
+        "rb",
+        "rake",
+        "gemspec",  # Ruby
+        "java",
+        "kt",
+        "kts",
+        "groovy",  # JVM
+        "scala",
+        "clj",
+        "cljs",  # Scala / Clojure
+        "c",
+        "h",
+        "cc",
+        "cpp",
+        "cxx",  # C / C++
+        "hh",
+        "hpp",
+        "hxx",
+        "cs",
+        "fs",
+        "fsx",
+        "fsi",  # C# / F#
+        "go",  # Go
+        "rs",  # Rust
+        "swift",  # Swift
+        "m",
+        "mm",  # Objective-C
+        "r",
+        "rmd",  # R
+        "jl",  # Julia
+        "lua",  # Lua
+        "pl",
+        "pm",
+        "t",  # Perl
+        "php",  # PHP
+        "ex",
+        "exs",  # Elixir
+        "erl",
+        "hrl",  # Erlang
+        "hs",
+        "lhs",  # Haskell
+        "ml",
+        "mli",  # OCaml
+        "elm",  # Elm
+        "dart",  # Dart
+        "v",
+        "vhd",
+        "vhdl",  # Verilog / VHDL
+        "zig",  # Zig
+        "nim",  # Nim
+        # ── shell / scripting ────────────────────────────────────────────────
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "ps1",
+        "psm1",
+        "psd1",  # PowerShell
+        "bat",
+        "cmd",  # Windows batch
+        "awk",
+        "sed",
+        # ── data / config ────────────────────────────────────────────────────
+        "json",
+        "jsonc",
+        "json5",
+        "yaml",
+        "yml",
+        "toml",
+        "ini",
+        "cfg",
+        "conf",
+        "config",
+        "properties",
+        "env",
+        "xml",
+        "xsd",
+        "xsl",
+        "xslt",
+        "html",
+        "htm",
+        "xhtml",
+        "css",
+        "scss",
+        "sass",
+        "less",
+        "svg",
+        "csv",
+        "tsv",
+        "psv",
+        "ndjson",
+        "jsonl",
+        "graphql",
+        "gql",
+        "proto",  # Protocol Buffers
+        "thrift",
+        "avsc",  # Avro schema
+        # ── documentation / markup ───────────────────────────────────────────
+        "md",
+        "markdown",
+        "rst",
+        "txt",
+        "text",
+        "adoc",
+        "asciidoc",
+        "org",
+        "tex",
+        "sty",
+        "cls",
+        "bib",  # LaTeX
+        "pod",  # Perl docs
+        "rdoc",
+        # ── build / CI / infra ───────────────────────────────────────────────
+        "makefile",
+        "mk",
+        "mak",
+        "dockerfile",
+        "cmake",
+        "bazel",
+        "bzl",
+        "build",
+        "gradle",
+        "tf",
+        "tfvars",  # Terraform
+        "hcl",
+        "nix",
+        "cabal",
+        "spec",  # RPM spec / test spec
+        # ── notebooks / interactive ──────────────────────────────────────────
+        "ipynb",  # JSON-based, readable
+        # ── lock files / manifests ───────────────────────────────────────────
+        "lock",  # various lockfiles (text)
+        "sum",  # go.sum
+        "mod",  # go.mod
+        # ── misc plain-text formats ──────────────────────────────────────────
+        "log",
+        "diff",
+        "patch",
+        "sql",
+        "pgsql",
+        "graphml",
+        "dot",
+        "gv",  # Graphviz
+        "puml",
+        "pu",  # PlantUML
+        "mmd",  # Mermaid
+        "vim",
+        "vimrc",
+        "emacs",
+        "el",
+        "editorconfig",
+        "gitignore",
+        "gitattributes",
+        "gitmodules",
+        "hgignore",
+        "dockerignore",
+        "npmignore",
+        "license",
+        "licence",
+        "authors",
+        "contributors",
+        "readme",
+        "changelog",
+        "news",
+        "todo",
+        "fixme",
+    }
+)
+
+
+def _looks_like_text(path: str) -> bool:
+    """Return True when *path*'s extension (or full basename for dotfiles /
+    extensionless names) suggests the file is human-readable text."""
+    import os
+
+    name = os.path.basename(path).lower()
+    # Dotfiles with no extension: .gitignore, .env, .editorconfig, …
+    if name.startswith(".") and "." not in name[1:]:
+        return name[1:] in _TEXT_EXTENSIONS or True  # dotfiles are usually text
+    # Strip leading dot for the extension comparison
+    if "." in name:
+        ext = name.rsplit(".", 1)[-1]
+        if ext in _TEXT_EXTENSIONS:
+            return True
+    # Extensionless or unrecognised — also accept files whose MIME is text/*
+    mime = _guess_mime(path)
+    if mime:
+        if mime.startswith("text/"):
+            return True
+        if mime in {
+            "application/json",
+            "application/x-yaml",
+            "application/toml",
+            "application/javascript",
+            "application/xml",
+            "application/x-sh",
+            "application/x-shellscript",
+        }:
+            return True
+    # Bare filenames like "Makefile", "Dockerfile", "Rakefile", "Gemfile" …
+    if name in {
+        "makefile",
+        "dockerfile",
+        "rakefile",
+        "gemfile",
+        "podfile",
+        "fastfile",
+        "appfile",
+        "vagrantfile",
+        "berksfile",
+        "guardfile",
+        "capfile",
+        "brewfile",
+    }:
+        return True
+    return False
 
 
 def _guess_mime(path: str) -> str | None:
@@ -592,6 +826,133 @@ def add_to_projspec_library(
         }
     except Exception as exc:
         return {"url": url, "project": None, "error": str(exc)}
+
+
+def inspect_as_project(
+    url: str,
+    storage_options: dict | None = None,
+) -> dict:
+    """Inspect a single file and return a project-shaped dict for the UI.
+
+    Produces the same ``to_dict(compact=False)`` structure as a real
+    ``DataProject`` scan so the embedded library panel renders it
+    identically — a single ``data_project`` spec chip whose contents
+    are ``Dataset``-shaped dicts, exactly as produced by
+    :class:`projspec.proj.data_project.DataProject`.
+
+    Returns the same keys as ``scan_directory`` plus the raw inspect
+    fields for the top-half metadata strip.
+    """
+    result = inspect_file(url, storage_options=storage_options)
+    if result.get("error"):
+        return {
+            "url": url,
+            "project": None,
+            "intake": None,
+            "text_preview": None,
+            "error": result["error"],
+        }
+
+    intake = result.get("intake")  # {"primary_type": "Parquet", "types": [...], ...}
+    text_preview = result.get("text_preview")
+    mime = result.get("mime_type") or ""
+    size = result.get("size")
+    mtime = result.get("last_modified")
+    name = result.get("name", _basename(url))
+
+    # Try to get richer intake info using intake.readers.inspect.inspect_dataset
+    # (same call DataProject uses).  Falls back gracefully if unavailable.
+    intake_inspect: dict | None = None
+    try:
+        from intake.readers.inspect import inspect_dataset  # type: ignore
+
+        intake_inspect = inspect_dataset(url, storage_options=storage_options or None)
+    except Exception:
+        pass
+
+    # Build a Dataset-shaped content item (klass ["content", "dataset"])
+    # matching the exact structure produced by DataProject._describe().
+    dataset_content: dict[str, Any] = {
+        "klass": ["content", "dataset"],
+        "url": url,
+        "datatype": (intake or {}).get("primary_type") or None,
+        "structure": list((intake_inspect or {}).get("structure", [])),
+        "schema": {},
+        "n_files": 1,
+        "total_size": size,
+        "metadata": {},
+    }
+
+    # Populate schema from intake discover() output if available
+    if intake_inspect:
+        schema = intake_inspect.get("schema") or {}
+        if schema:
+            dataset_content["schema"] = schema
+        meta = {
+            k: v
+            for k, v in intake_inspect.items()
+            if k not in ("schema", "structure", "datatype", "url")
+            and isinstance(v, (str, int, float, bool, list, dict, type(None)))
+        }
+        if meta:
+            dataset_content["metadata"] = meta
+    elif intake:
+        # Fallback: populate schema from intake._intake_inspect output
+        dtype = intake.get("dtype")
+        if dtype and isinstance(dtype, dict):
+            dataset_content["schema"] = dtype
+        # surface npartitions, shape etc. in metadata
+        meta = {
+            k: v
+            for k, v in intake.items()
+            if k not in ("primary_type", "types", "dtype") and v is not None
+        }
+        if meta:
+            dataset_content["metadata"] = meta
+
+    # Contents dict keyed by the short file name (mimicking DataProject)
+    contents: dict[str, Any] = {name: dataset_content}
+
+    # Text-preview as a separate content item when available
+    if text_preview:
+        contents["text_preview"] = {
+            "klass": ["content", "text_preview"],
+            "preview": text_preview,
+        }
+
+    # Single spec: "data_project", just like DataProject scans
+    project: dict[str, Any] = {
+        "url": url,
+        "specs": {
+            "data_project": {
+                "klass": ["spec", "data_project"],
+                "_contents": contents,
+                "_artifacts": {},
+            }
+        },
+        # No top-level contents/artifacts — avoids the duplicate "Global" chip
+        "contents": {},
+        "artifacts": {},
+        "klass": ["project", "data_project"],
+        "file_count": 1,
+        "total_size": size,
+        "last_modified": mtime,
+        "storage_options": storage_options or {},
+        "scanned_at": None,
+    }
+
+    return {
+        "url": url,
+        "project": project,
+        # Top-level fields for the inspectResult / renderMeta strip
+        "name": name,
+        "size": size,
+        "last_modified": mtime,
+        "mime_type": mime or None,
+        "intake": intake,
+        "text_preview": text_preview,
+        "error": None,
+    }
 
 
 def supported_protocols() -> list[str]:

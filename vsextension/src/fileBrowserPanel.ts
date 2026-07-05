@@ -382,10 +382,60 @@ export class FileBrowserPanel {
     private async inspect(url: string, storageOptions: string | undefined): Promise<void> {
         log('inspect ' + url);
         const so = storageOptions ? JSON.parse(storageOptions) : null;
-        const res = await runFbPython('inspect_file', so ? { url, storage_options: so } : { url });
+        // inspect_as_project returns both the raw inspect fields (size, mtime,
+        // mime_type, text_preview) AND a project-shaped dict for the scan pane.
+        const res = await runFbPython('inspect_as_project', so ? { url, storage_options: so } : { url });
         const data = (res.data as Record<string, unknown>) || { url, error: res.stderr || `exit ${res.code}` };
-        log('inspect result: ' + (data.error || data.mime_type));
+        log('inspect result: ' + (data['error'] || data['mime_type'] || (data['project'] ? 'project' : 'no project')));
+
+        // Top half: lightweight metadata (name, size, mtime, mime_type, intake, text_preview)
         this.panel.webview.postMessage({ type: 'inspectResult', ...data });
+
+        // Bottom half (scan pane): project-shaped view — same as directory scan
+        // Fetch info/enums in parallel so the panel has full documentation
+        const [infoResult, enumsResult] = await Promise.all([
+            new Promise<unknown>((resolve) => {
+                const proc = childProcess.spawn('projspec', ['info'], { env: process.env });
+                let stdout = '';
+                proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+                proc.on('error', () => resolve({}));
+                proc.on('close', () => { try { resolve(JSON.parse(stdout.trim())); } catch { resolve({}); } });
+            }),
+            new Promise<unknown>((resolve) => {
+                const script = [
+                    'import json, importlib, pkgutil',
+                    'import projspec.utils as pu',
+                    'import projspec.content, projspec.artifact',
+                    "for pkg in (projspec.content, projspec.artifact):",
+                    "    for m in pkgutil.iter_modules(pkg.__path__, pkg.__name__ + '.'):",
+                    '        importlib.import_module(m.name)',
+                    'from projspec.utils import camel_to_snake',
+                    'out, seen = {}, set()',
+                    'def walk(cls):',
+                    '    for sub in cls.__subclasses__():',
+                    '        if sub in seen: continue',
+                    '        seen.add(sub); walk(sub)',
+                    '        out[camel_to_snake(sub.__name__)] = {m.name: m.value for m in sub}',
+                    'walk(pu.Enum)',
+                    'print(json.dumps(out))',
+                ].join('\n');
+                const proc = childProcess.spawn('python3', ['-c', script], { env: process.env });
+                let stdout = '';
+                proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+                proc.on('error', () => resolve({}));
+                proc.on('close', () => { try { resolve(JSON.parse(stdout.trim())); } catch { resolve({}); } });
+            }),
+        ]);
+
+        this.panel.webview.postMessage({
+            type: 'projectScanned',
+            url,
+            project: data['project'] || null,
+            error: data['error'] || null,
+            text_preview: data['text_preview'] || null,
+            info: infoResult || {},
+            enums: enumsResult || {},
+        });
     }
 
     private async openFileInEditor(
@@ -828,7 +878,10 @@ const FB_HTML_BODY = `
       <div id="fb-info-preview"></div>
      </div>
      <div id="fb-scan-pane" class="hidden">
+       <!-- For directories: embedded project panel -->
        <div id="fb-scan-panel-root"></div>
+       <!-- For files: inline content display (no project widget) -->
+       <div id="fb-file-content" class="hidden"></div>
      </div>
   </div>
 
@@ -947,6 +1000,83 @@ body { margin: 0; padding: 0;
   overflow: hidden;
   display: flex;
   flex-direction: column;
+}
+/* Inline file content display — used instead of the embedded panel for files */
+#fb-file-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 14px;
+  font-size: 12px;
+}
+.fc-section-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vscode-descriptionForeground);
+  margin-bottom: 6px;
+}
+.fc-dataset {
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.fc-datatype {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 6px;
+  color: var(--vscode-foreground);
+}
+.fc-schema-hdr {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vscode-descriptionForeground);
+  margin: 6px 0 3px;
+}
+.fc-col-row {
+  display: flex;
+  gap: 8px;
+  padding: 1px 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+}
+.fc-col-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fc-col-dtype { color: var(--vscode-descriptionForeground); flex-shrink: 0; }
+.fc-kv { display: flex; gap: 8px; margin-bottom: 2px; flex-wrap: wrap; }
+.fc-k { color: var(--vscode-descriptionForeground); min-width: 80px; flex-shrink: 0; }
+.fc-v { word-break: break-all; }
+.fc-text-preview {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--vscode-textBlockQuote-background, rgba(128,128,128,0.08));
+  padding: 8px;
+  border-radius: 3px;
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid var(--vscode-panel-border);
+}
+.fc-html-repr {
+  font-size: 11px;
+  overflow-x: auto;
+  margin-bottom: 4px;
+}
+.fc-html-repr table { border-collapse: collapse; font-size: 11px; }
+.fc-html-repr th, .fc-html-repr td {
+  border: 1px solid var(--vscode-panel-border);
+  padding: 2px 6px;
+}
+.fc-html-repr th { background: var(--vscode-list-hoverBackground); }
+.fc-thumbnail {
+  max-width: 100%;
+  height: auto;
+  margin: 4px 0;
+  border-radius: 3px;
 }
 #fb-scan-panel-root #app {
   flex-direction: column;
@@ -1456,6 +1586,7 @@ function getFileBrowserJs(): string {
     let bookmarks = [];
     let protocols = [];
     var libraryUrls = new Set();  // canonical URLs of entries in the project library
+    var selectedIsFile = false;   // true when the current selection is a file (not a dir)
     let currentUrl = '';
     let currentSo  = '';
     let history    = [];
@@ -1477,9 +1608,10 @@ function getFileBrowserJs(): string {
     const infoActions = document.getElementById('fb-info-actions');
     const infoMeta    = document.getElementById('fb-info-meta');
     const infoPreview = document.getElementById('fb-info-preview');
-    const scanPane    = document.getElementById('fb-scan-pane');
-    const scanStatus  = document.getElementById('fb-scan-status');
+    const scanPane      = document.getElementById('fb-scan-pane');
+    const scanStatus    = document.getElementById('fb-scan-status');
     const scanPanelRoot = document.getElementById('fb-scan-panel-root');
+    const fileContent   = document.getElementById('fb-file-content');
     const bmPanel     = document.getElementById('bm-panel');
     const bmList      = document.getElementById('bm-list');
     const soOverlay   = document.getElementById('so-overlay');
@@ -1816,19 +1948,33 @@ function getFileBrowserJs(): string {
         infoActions.classList.remove('hidden');
 
         const isFile = type !== 'directory';
+        selectedIsFile = isFile;
         document.getElementById('btn-open-editor').style.display = isFile ? '' : 'none';
         document.getElementById('btn-add-to-lib').style.display = type === 'directory' ? '' : 'none';
 
         infoMeta.innerHTML = '';
         infoPreview.innerHTML = '';
 
-        // Always hide and reset the scan pane when selection changes
+        // Reset both scan pane variants on every selection change.
+        // Also send an empty library to the embedded panel so the previous
+        // directory's project widget and details are cleared immediately.
         if (scanPane) {
             scanPane.classList.add('hidden');
             if (scanStatus) scanStatus.textContent = '';
         }
+        if (scanPanelRoot) scanPanelRoot.classList.remove('hidden');
+        if (fileContent)   { fileContent.classList.add('hidden'); fileContent.innerHTML = ''; }
+        if (typeof window.__fbPanelDeliver === 'function') {
+            window.__fbPanelDeliver({ type: 'data', library: {}, info: {}, enums: {} });
+        }
 
         if (isFile) {
+            // Show scan pane immediately with loading indicator — it gets populated
+            // when both inspectResult and projectScanned arrive
+            if (scanPane) {
+                scanPane.classList.remove('hidden');
+                if (scanStatus) scanStatus.textContent = 'inspecting...';
+            }
             dbg('posting inspect for ' + url);
             vscode.postMessage({ cmd: 'inspect', url: url, storageOptions: currentSo || undefined });
         } else {
@@ -1879,10 +2025,10 @@ function getFileBrowserJs(): string {
         }
     }
 
-    function renderMeta(data) {
+     function renderMeta(data) {
         infoMeta.innerHTML = '';
         var rows = [];
-        if (data.type)          rows.push(['Type', data.type]);
+        // Don't show data.type — it's the JS message type, not a file type
         if (data.size != null)  rows.push(['Size', fmtSize(data.size)]);
         if (data.last_modified) rows.push(['Modified', fmtDate(data.last_modified)]);
         if (data.mime_type)     rows.push(['MIME', data.mime_type]);
@@ -1896,83 +2042,18 @@ function getFileBrowserJs(): string {
 
     function renderInspect(data) {
         dbg('renderInspect name=' + data.name + ' error=' + data.error);
-        renderMeta(data);
+        // For files: only show MIME in the meta strip — size/modified are already
+        // visible in the file tree columns and would be redundant here.
+        // The intake type and text preview now live in the scan pane below.
+        infoMeta.innerHTML = '';
+        if (data.mime_type) {
+            const row = document.createElement('div');
+            row.className = 'info-row';
+            row.innerHTML = '<span class="info-key">MIME</span><span>' + escHtml(data.mime_type) + '</span>';
+            infoMeta.appendChild(row);
+        }
+        // Clear preview — content is in the scan pane
         infoPreview.innerHTML = '';
-
-        if (data.intake) {
-            const intake = data.intake;
-
-            // Header: primary type badge
-            const hdr = document.createElement('div');
-            hdr.className = 'preview-label';
-            hdr.textContent = 'Data type (intake)';
-            infoPreview.appendChild(hdr);
-
-            const card = document.createElement('div');
-            card.className = 'intake-card';
-
-            // Primary type — shown prominently
-            if (intake.primary_type) {
-                const typeRow = document.createElement('div');
-                typeRow.className = 'intake-type-badge';
-                typeRow.textContent = intake.primary_type;
-                card.appendChild(typeRow);
-            }
-
-            // Additional recognised types (if more than one)
-            if (intake.types && intake.types.length > 1) {
-                const also = document.createElement('div');
-                also.className = 'intake-row';
-                also.innerHTML = '<span class="intake-key">also</span>'
-                    + '<span class="intake-val">' + escHtml(intake.types.slice(1).join(', ')) + '</span>';
-                card.appendChild(also);
-            }
-
-            // Schema: dtype dict → column table
-            if (intake.dtype && typeof intake.dtype === 'object' && !Array.isArray(intake.dtype)) {
-                const schemaHdr = document.createElement('div');
-                schemaHdr.className = 'intake-schema-hdr';
-                schemaHdr.textContent = 'Columns';
-                card.appendChild(schemaHdr);
-                const cols = Object.keys(intake.dtype);
-                for (var ci = 0; ci < cols.length; ci++) {
-                    const colRow = document.createElement('div');
-                    colRow.className = 'intake-col-row';
-                    colRow.innerHTML = '<span class="intake-col-name">' + escHtml(cols[ci]) + '</span>'
-                        + '<span class="intake-col-dtype">' + escHtml(String(intake.dtype[cols[ci]])) + '</span>';
-                    card.appendChild(colRow);
-                }
-            }
-
-            // Other schema fields (shape, npartitions, etc.) — skip types/dtype/primary_type
-            const SKIP = new Set(['types', 'dtype', 'primary_type', 'name']);
-            const entries = Object.entries(intake);
-            for (var i = 0; i < entries.length; i++) {
-                const k = entries[i][0], v = entries[i][1];
-                if (SKIP.has(k) || v == null) continue;
-                const row = document.createElement('div');
-                row.className = 'intake-row';
-                const vStr = typeof v === 'object' ? JSON.stringify(v) : String(v);
-                row.innerHTML = '<span class="intake-key">' + escHtml(k) + '</span>'
-                              + '<span class="intake-val">' + escHtml(vStr) + '</span>';
-                card.appendChild(row);
-            }
-
-            infoPreview.appendChild(card);
-        }
-
-        // Text preview — always shown for text files
-        if (data.text_preview) {
-            const label = document.createElement('div');
-            label.className = 'preview-label';
-            label.style.marginTop = '10px';
-            label.textContent = 'Preview';
-            infoPreview.appendChild(label);
-            const pre = document.createElement('pre');
-            pre.className = 'preview-text';
-            pre.textContent = data.text_preview;
-            infoPreview.appendChild(pre);
-        }
     }
 
     // ── navigation ─────────────────────────────────────────────────────────
@@ -2231,6 +2312,180 @@ function getFileBrowserJs(): string {
     // window.__fbPanelDeliver(msg) — call it to push a data message into
     // the embedded panel.
 
+    // ── file content display (inline, no project widget) ─────────────────
+    // For single-file selections we render content directly rather than
+    // routing through the embedded library panel.  The rule:
+    //   - If the file has meaningful data info (datatype + schema/metadata),
+    //     show that.  Text preview is suppressed — the data description is
+    //     the useful thing.
+    //   - Otherwise show the text preview (first N lines).
+    //   - If neither is available, hide the scan pane.
+    function showFileInScanPane(data) {
+        if (!scanPane || !fileContent) return;
+
+        // Switch: hide the embedded panel root, show the file content div
+        if (scanPanelRoot) scanPanelRoot.classList.add('hidden');
+        fileContent.classList.remove('hidden');
+        fileContent.innerHTML = '';
+
+        var proj = data.project;
+        var textPreview = data.text_preview || '';
+
+        // Extract the dataset content from the data_project spec
+        var dataset = null;
+        if (proj && proj.specs && proj.specs.data_project) {
+            var cont = proj.specs.data_project._contents || {};
+            var keys = Object.keys(cont);
+            for (var i = 0; i < keys.length; i++) {
+                var item = cont[keys[i]];
+                if (item && item.klass && item.klass[1] === 'dataset') {
+                    dataset = item;
+                    break;
+                }
+            }
+        }
+
+        var hasData = dataset && (
+            dataset.datatype ||
+            (dataset.schema && Object.keys(dataset.schema).length > 0) ||
+            (dataset.metadata && Object.keys(dataset.metadata).length > 0)
+        );
+
+        if (hasData) {
+            var card = document.createElement('div');
+            card.className = 'fc-dataset';
+
+            // Datatype heading
+            if (dataset.datatype) {
+                var dtEl = document.createElement('div');
+                dtEl.className = 'fc-datatype';
+                dtEl.textContent = dataset.datatype;
+                card.appendChild(dtEl);
+            }
+
+            var meta = dataset.metadata || {};
+
+            // HTML repr — render inline (sanitised: strip scripts/iframes)
+            var htmlRepr = typeof meta.html_repr === 'string' ? meta.html_repr : null;
+            if (htmlRepr) {
+                var reprDiv = document.createElement('div');
+                reprDiv.className = 'fc-html-repr';
+                reprDiv.innerHTML = sanitizeHtmlRepr(htmlRepr);
+                card.appendChild(reprDiv);
+            }
+
+            // Thumbnail image (data: URI only)
+            var thumb = typeof meta.thumbnail === 'string' ? meta.thumbnail : null;
+            if (thumb && /^data:image\//i.test(thumb)) {
+                var img = document.createElement('img');
+                img.src = thumb;
+                img.className = 'fc-thumbnail';
+                img.alt = 'thumbnail';
+                card.appendChild(img);
+            }
+
+            // Schema / columns — only if no richer HTML repr
+            if (!htmlRepr) {
+                var schema = dataset.schema;
+                if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
+                    var cols = Object.keys(schema);
+                    if (cols.length > 0) {
+                        var schemaHdr = document.createElement('div');
+                        schemaHdr.className = 'fc-schema-hdr';
+                        schemaHdr.textContent = 'Columns';
+                        card.appendChild(schemaHdr);
+                        for (var ci = 0; ci < cols.length; ci++) {
+                            var colRow = document.createElement('div');
+                            colRow.className = 'fc-col-row';
+                            colRow.innerHTML = '<span class="fc-col-name">' + escHtml(cols[ci]) + '</span>'
+                                + '<span class="fc-col-dtype">' + escHtml(String(schema[cols[ci]])) + '</span>';
+                            card.appendChild(colRow);
+                        }
+                    }
+                }
+            }
+
+            // Metadata key-values — skip html_repr/thumbnail (already rendered above)
+            var SKIP_META = new Set(['html_repr', 'thumbnail']);
+            var mkeys = Object.keys(meta);
+            for (var mi = 0; mi < mkeys.length; mi++) {
+                var mk = mkeys[mi], mv = meta[mk];
+                if (SKIP_META.has(mk) || mv == null) continue;
+                var mvStr = typeof mv === 'object' ? JSON.stringify(mv) : String(mv);
+                if (!mvStr || mvStr === '{}' || mvStr === '[]') continue;
+                var kvEl = document.createElement('div');
+                kvEl.className = 'fc-kv';
+                kvEl.innerHTML = '<span class="fc-k">' + escHtml(mk) + ':</span>'
+                    + '<span class="fc-v">' + escHtml(mvStr) + '</span>';
+                card.appendChild(kvEl);
+            }
+
+            // Structure tags (e.g. ["table"])
+            var structure = dataset.structure;
+            if (Array.isArray(structure) && structure.length > 0) {
+                var stEl = document.createElement('div');
+                stEl.className = 'fc-kv';
+                stEl.innerHTML = '<span class="fc-k">structure:</span>'
+                    + '<span class="fc-v">' + escHtml(structure.join(', ')) + '</span>';
+                card.appendChild(stEl);
+            }
+
+            fileContent.appendChild(card);
+
+            // For data files, also show text preview below if there's no html_repr
+            // (e.g. CSV — the first few rows are more useful than just column names)
+            if (!htmlRepr && textPreview) {
+                var prevHdr = document.createElement('div');
+                prevHdr.className = 'fc-schema-hdr';
+                prevHdr.style.marginTop = '10px';
+                prevHdr.textContent = 'Preview';
+                fileContent.appendChild(prevHdr);
+                var pre2 = document.createElement('pre');
+                pre2.className = 'fc-text-preview';
+                pre2.textContent = textPreview;
+                fileContent.appendChild(pre2);
+            }
+
+        } else if (textPreview) {
+            // Pure text file — just show the preview
+            var pre = document.createElement('pre');
+            pre.className = 'fc-text-preview';
+            pre.textContent = textPreview;
+            fileContent.appendChild(pre);
+
+        } else {
+            // Nothing to show — hide the scan pane
+            scanPane.classList.add('hidden');
+        }
+    }
+
+    // Minimal sanitiser for html_repr content (strips scripts, iframes, on* handlers)
+    function sanitizeHtmlRepr(html) {
+        var tpl = document.createElement('template');
+        tpl.innerHTML = String(html);
+        var walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_ELEMENT);
+        var toRemove = [];
+        var n = walker.nextNode();
+        while (n) {
+            var tag = n.tagName.toLowerCase();
+            if (tag === 'script' || tag === 'iframe' || tag === 'object' || tag === 'embed') {
+                toRemove.push(n);
+            } else {
+                var attrs = Array.from(n.attributes);
+                for (var ai = 0; ai < attrs.length; ai++) {
+                    var an = attrs[ai].name.toLowerCase();
+                    if (an.startsWith('on')) { n.removeAttribute(attrs[ai].name); continue; }
+                    if ((an === 'href' || an === 'src') && /^\s*javascript:/i.test(attrs[ai].value)) {
+                        n.removeAttribute(attrs[ai].name);
+                    }
+                }
+            }
+            n = walker.nextNode();
+        }
+        for (var ri = 0; ri < toRemove.length; ri++) toRemove[ri].remove();
+        return tpl.innerHTML;
+    }
+
     function showProjectInPanel(data) {
         if (!scanPanelRoot) return;
         if (scanStatus) scanStatus.textContent = '';
@@ -2258,7 +2513,7 @@ function getFileBrowserJs(): string {
     // ── message bus ────────────────────────────────────────────────────────
     window.addEventListener('message', function(ev) {
         const msg = ev.data;
-        dbg('recv type=' + msg.type);
+        // (type logged selectively in each case handler)
         switch (msg.type) {
             case 'loading':
                 spinner.classList.toggle('hidden', !msg.loading);
@@ -2297,8 +2552,14 @@ function getFileBrowserJs(): string {
                 break;
 
             case 'projectScanned':
-                dbg('projectScanned url=' + msg.url + ' error=' + msg.error);
-                showProjectInPanel(msg);
+                dbg('projectScanned url=' + msg.url);
+                if (selectedIsFile) {
+                    // Single file: inline display, no project widget
+                    showFileInScanPane(msg);
+                } else {
+                    // Directory: full embedded library panel
+                    showProjectInPanel(msg);
+                }
                 break;
 
             case 'bookmarksUpdated':
