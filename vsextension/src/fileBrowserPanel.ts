@@ -20,7 +20,7 @@ import * as childProcess from 'child_process';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
-import { parseJsonOutput } from './projspec';
+import { parseJsonOutput, runProjspec } from './projspec';
 
 // ---------------------------------------------------------------------------
 // Output channel for host-side logging (visible in Output > projspec-filebrowser)
@@ -101,7 +101,7 @@ export class FileBrowserPanel {
     private disposables: vscode.Disposable[] = [];
     private busyCount = 0;
     /** Pending initial data to send once the webview posts 'ready'. */
-    private pendingInit: { bookmarks: unknown[]; protocols: string[]; startUrl: string } | null = null;
+    private pendingInit: { bookmarks: unknown[]; protocols: string[]; libraryUrls: string[]; startUrl: string } | null = null;
 
     // ---------------------------------------------------------------------------
     // Factory
@@ -178,6 +178,7 @@ export class FileBrowserPanel {
         log('prefetchInit start');
         let bookmarks: unknown[] = [];
         let protocols: string[] = [];
+        let libraryUrls: string[] = [];
         try {
             const bmsRes = await runFbPython('bookmarks_list', {});
             if (Array.isArray(bmsRes.data)) { bookmarks = bmsRes.data; }
@@ -186,8 +187,15 @@ export class FileBrowserPanel {
             const protoRes = await runFbPython('supported_protocols', {});
             if (Array.isArray(protoRes.data)) { protocols = protoRes.data as string[]; }
         } catch (e) { log('supported_protocols error: ' + e); }
-        log(`prefetchInit done: ${bookmarks.length} bookmarks, ${protocols.length} protocols`);
-        this.pendingInit = { bookmarks, protocols, startUrl: startUrl || os.homedir() };
+        try {
+            const libRes = await runProjspec(['library', 'list', '--json-out']);
+            if (libRes.code === 0) {
+                const libData = parseJsonOutput(libRes.stdout) as Record<string, unknown>;
+                libraryUrls = Object.keys(libData);
+            }
+        } catch (e) { log('library list error: ' + e); }
+        log(`prefetchInit done: ${bookmarks.length} bookmarks, ${protocols.length} protocols, ${libraryUrls.length} library entries`);
+        this.pendingInit = { bookmarks, protocols, libraryUrls, startUrl: startUrl || os.homedir() };
         if (this.readyReceived) {
             void this.sendInitialData();
         }
@@ -205,6 +213,7 @@ export class FileBrowserPanel {
                 type: 'init',
                 bookmarks: init.bookmarks,
                 protocols: init.protocols,
+                libraryUrls: init.libraryUrls,
             });
             await this.browse(init.startUrl, undefined, false);
         });
@@ -320,6 +329,11 @@ export class FileBrowserPanel {
                     await this.withBusy(() =>
                         this.scanDir(msg.url as string, msg.storageOptions as string | undefined),
                     );
+                    break;
+
+                case 'expandDir':
+                    // Lazy-load children of a tree node without navigating
+                    void this.expandDir(msg.url as string, msg.storageOptions as string | undefined);
                     break;
 
                 case 'goToUrl':
@@ -520,6 +534,14 @@ export class FileBrowserPanel {
                 vscode.window.showWarningMessage(`Add to library: ${data['error']}`);
             } else {
                 vscode.window.showInformationMessage(`Added to projspec library: ${url}`);
+                // Refresh library URL set so the indicator updates immediately
+                try {
+                    const libRes = await runProjspec(['library', 'list', '--json-out']);
+                    if (libRes.code === 0) {
+                        const libData = parseJsonOutput(libRes.stdout) as Record<string, unknown>;
+                        this.panel.webview.postMessage({ type: 'libraryUrlsUpdated', libraryUrls: Object.keys(libData) });
+                    }
+                } catch { /* ok */ }
             }
         });
     }
@@ -528,52 +550,111 @@ export class FileBrowserPanel {
         await this.browse(url, storageOptions, true);
     }
 
+    private async expandDir(url: string, storageOptions: string | undefined): Promise<void> {
+        log('expandDir ' + url);
+        const so = storageOptions ? JSON.parse(storageOptions) : null;
+        const kwargs: Record<string, unknown> = { url };
+        if (so) { kwargs['storage_options'] = so; }
+        const res = await runFbPython('browse', kwargs);
+        const data = (res.data as Record<string, unknown>) || {
+            url, entries: [], parent: null, protocol: '',
+            error: res.stderr || `exit ${res.code}`,
+        };
+        this.panel.webview.postMessage({ type: 'expandResult', parentUrl: url, ...data });
+    }
+
     private async scanDir(url: string, storageOptions: string | undefined): Promise<void> {
         log('scanDir ' + url);
         const so = storageOptions ? JSON.parse(storageOptions) : null;
         const srcPath = path.resolve(__dirname, '..', '..', 'src');
         const soArg = so ? JSON.stringify(so) : '';
-        // Try projspec CLI first (fastest when projspec is installed in the env).
-        // Fall back to importing projspec.filebrowser.scan_directory directly.
-        const result = await new Promise<{data: unknown; stderr: string; code: number|null}>((resolve) => {
-            const script = [
-                'import sys, json, subprocess',
-                `sys.path.insert(0, ${JSON.stringify(srcPath)})`,
-                `url = ${JSON.stringify(url)}`,
-                `so_str = ${JSON.stringify(soArg)}`,
-                'args = ["projspec", "scan", "--json-out", url]',
-                'if so_str: args = ["projspec", "scan", "--json-out", "--storage_options", so_str, url]',
-                'r = subprocess.run(args, capture_output=True, text=True)',
-                'if r.returncode == 0 and r.stdout.strip():',
-                '    raw = r.stdout.strip()',
-                '    idx = raw.find("{")',
-                '    if idx >= 0: raw = raw[idx:]',
-                '    proj = json.loads(raw)',
-                '    print(json.dumps({"url": url, "project": proj, "error": None}))',
-                '    sys.exit(0)',
-                // Fall back to direct import
-                'try:',
-                '    from projspec.filebrowser import scan_directory',
-                '    so = json.loads(so_str) if so_str else None',
-                '    result = scan_directory(url, storage_options=so)',
-                'except Exception as e:',
-                '    result = {"url": url, "project": None, "error": str(e)}',
-                'print(json.dumps(result))',
-            ].join('\n');
-            const proc = childProcess.spawn(python3(), ['-c', script], { env: process.env });
-            let stdout = '', stderr = '';
-            proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
-            proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-            proc.on('error', (err: Error) => resolve({ data: null, stderr: String(err), code: -1 }));
-            proc.on('close', (code: number | null) => {
-                log(`scanDir exit=${code} out=${stdout.slice(0,200)} err=${stderr.slice(0,200)}`);
-                let data: unknown = null;
-                try { data = JSON.parse(stdout.trim()); } catch { /* ok */ }
-                resolve({ data, stderr, code });
-            });
+
+        // Run projspec scan, info, and enum introspection in parallel
+        const [scanResult, infoResult, enumsResult] = await Promise.all([
+            // 1. Scan the directory
+            new Promise<{data: unknown; stderr: string; code: number|null}>((resolve) => {
+                const script = [
+                    'import sys, json, subprocess',
+                    `sys.path.insert(0, ${JSON.stringify(srcPath)})`,
+                    `url = ${JSON.stringify(url)}`,
+                    `so_str = ${JSON.stringify(soArg)}`,
+                    'args = ["projspec", "scan", "--json-out", url]',
+                    'if so_str: args = ["projspec", "scan", "--json-out", "--storage_options", so_str, url]',
+                    'r = subprocess.run(args, capture_output=True, text=True)',
+                    'if r.returncode == 0 and r.stdout.strip():',
+                    '    raw = r.stdout.strip()',
+                    '    idx = raw.find("{")',
+                    '    if idx >= 0: raw = raw[idx:]',
+                    '    proj = json.loads(raw)',
+                    '    print(json.dumps({"url": url, "project": proj, "error": None}))',
+                    '    sys.exit(0)',
+                    // Fall back to direct import
+                    'try:',
+                    '    from projspec.filebrowser import scan_directory',
+                    '    so = json.loads(so_str) if so_str else None',
+                    '    result = scan_directory(url, storage_options=so)',
+                    'except Exception as e:',
+                    '    result = {"url": url, "project": None, "error": str(e)}',
+                    'print(json.dumps(result))',
+                ].join('\n');
+                const proc = childProcess.spawn(python3(), ['-c', script], { env: process.env });
+                let stdout = '', stderr = '';
+                proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+                proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+                proc.on('error', (err: Error) => resolve({ data: null, stderr: String(err), code: -1 }));
+                proc.on('close', (code: number | null) => {
+                    log(`scanDir exit=${code} out=${stdout.slice(0,200)} err=${stderr.slice(0,200)}`);
+                    let data: unknown = null;
+                    try { data = JSON.parse(stdout.trim()); } catch { /* ok */ }
+                    resolve({ data, stderr, code });
+                });
+            }),
+            // 2. Fetch class info (for documentation popups)
+            new Promise<unknown>((resolve) => {
+                const proc = childProcess.spawn('projspec', ['info'], { env: process.env });
+                let stdout = '';
+                proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+                proc.on('error', () => resolve({}));
+                proc.on('close', () => {
+                    try { resolve(JSON.parse(stdout.trim())); } catch { resolve({}); }
+                });
+            }),
+            // 3. Fetch enum members (for human-readable enum values in YAML tree)
+            new Promise<unknown>((resolve) => {
+                const script = [
+                    'import json, importlib, pkgutil',
+                    'import projspec.utils as pu',
+                    'import projspec.content, projspec.artifact',
+                    "for pkg in (projspec.content, projspec.artifact):",
+                    "    for m in pkgutil.iter_modules(pkg.__path__, pkg.__name__ + '.'):",
+                    '        importlib.import_module(m.name)',
+                    'from projspec.utils import camel_to_snake',
+                    'out, seen = {}, set()',
+                    'def walk(cls):',
+                    '    for sub in cls.__subclasses__():',
+                    '        if sub in seen: continue',
+                    '        seen.add(sub); walk(sub)',
+                    '        out[camel_to_snake(sub.__name__)] = {m.name: m.value for m in sub}',
+                    'walk(pu.Enum)',
+                    'print(json.dumps(out))',
+                ].join('\n');
+                const proc = childProcess.spawn('python3', ['-c', script], { env: process.env });
+                let stdout = '';
+                proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+                proc.on('error', () => resolve({}));
+                proc.on('close', () => {
+                    try { resolve(JSON.parse(stdout.trim())); } catch { resolve({}); }
+                });
+            }),
+        ]);
+
+        const data = (scanResult.data as Record<string, unknown>) || { url, error: scanResult.stderr || `exit ${scanResult.code}` };
+        this.panel.webview.postMessage({
+            type: 'projectScanned',
+            info: infoResult || {},
+            enums: enumsResult || {},
+            ...data,
         });
-        const data = (result.data as Record<string, unknown>) || { url, error: result.stderr || `exit ${result.code}` };
-        this.panel.webview.postMessage({ type: 'projectScanned', ...data });
     }
 
     // ---------------------------------------------------------------------------
@@ -713,6 +794,11 @@ const FB_HTML_BODY = `
     <!-- fb-empty and fb-error are SIBLINGS of fb-entries, not children,
          so clearing fb-entries does not destroy them. -->
     <div id="fb-file-list">
+      <div id="fb-col-headers">
+        <span class="fb-col-name fb-col-hdr" data-col="name">Name <span class="fb-sort-arrow"></span></span>
+        <span class="fb-col-size fb-col-hdr" data-col="size">Size <span class="fb-sort-arrow"></span></span>
+        <span class="fb-col-mtime fb-col-hdr" data-col="mtime">Modified <span class="fb-sort-arrow"></span></span>
+      </div>
       <div id="fb-empty"   class="fb-status hidden">Directory is empty.</div>
       <div id="fb-error"   class="fb-status fb-error hidden"></div>
       <div id="fb-entries"></div>
@@ -962,27 +1048,107 @@ body { margin: 0; padding: 0;
 #fb-file-list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 0;
-}
-.fb-entry {
   display: flex;
-  align-items: center;
-  padding: 3px 10px;
+  flex-direction: column;
+}
+#fb-col-headers {
+  display: grid;
+  grid-template-columns: 1fr 72px 112px;
+  padding: 2px 10px 2px 26px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vscode-descriptionForeground);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  flex-shrink: 0;
+}
+.fb-col-hdr {
   cursor: pointer;
-  gap: 6px;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 2px;
+  padding: 1px 2px;
+}
+.fb-col-hdr:hover { color: var(--vscode-foreground); }
+.fb-col-hdr.active { color: var(--vscode-foreground); }
+.fb-sort-arrow { font-size: 9px; opacity: 0.6; min-width: 8px; }
+.fb-col-size, .fb-col-mtime {
+  text-align: right;
+  justify-content: flex-end;
+}
+#fb-entries { flex: 1; overflow-y: auto; }
+
+/* Tree entry row */
+.fb-entry {
+  display: grid;
+  grid-template-columns: 1fr 72px 112px;
+  align-items: center;
+  padding: 2px 10px;
+  cursor: pointer;
+  gap: 0;
   border: 1px solid transparent;
   border-radius: 2px;
   position: relative;
+  min-width: 0;
 }
 .fb-entry:hover { background: var(--vscode-list-hoverBackground); }
 .fb-entry.active {
   background: var(--vscode-list-activeSelectionBackground);
   color: var(--vscode-list-activeSelectionForeground);
 }
-.fb-entry-icon { width: 16px; text-align: center; flex-shrink: 0; font-size: 14px; }
-.fb-entry-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.fb-entry-meta { font-size: 11px; color: var(--vscode-descriptionForeground); white-space: nowrap; flex-shrink: 0; }
+/* name cell: indent + toggle + icon + text */
+.fb-entry-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+.fb-entry-indent { display: inline-block; flex-shrink: 0; }
+.fb-entry-toggle {
+  width: 14px;
+  flex-shrink: 0;
+  text-align: center;
+  font-size: 9px;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  user-select: none;
+}
+.fb-entry-toggle:hover { color: var(--vscode-foreground); }
+.fb-entry-icon { width: 16px; text-align: center; flex-shrink: 0; font-size: 13px; }
+.fb-entry-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
 .fb-entry.is-dir .fb-entry-name { font-weight: 500; }
+.fb-entry-size {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  text-align: right;
+  white-space: nowrap;
+}
+.fb-entry-mtime {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fb-entry.active .fb-entry-size,
+.fb-entry.active .fb-entry-mtime {
+  color: inherit;
+  opacity: 0.8;
+}
+/* Children container — indented child rows */
+.fb-children { display: none; }
+.fb-children.expanded { display: block; }
+.fb-child-loading {
+  padding: 3px 10px 3px 36px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
 
 .fb-status { padding: 20px; color: var(--vscode-descriptionForeground); text-align: center; }
 .fb-error  { padding: 12px; color: var(--vscode-errorForeground); }
@@ -1289,6 +1455,7 @@ function getFileBrowserJs(): string {
     // ── state ──────────────────────────────────────────────────────────────
     let bookmarks = [];
     let protocols = [];
+    var libraryUrls = new Set();  // canonical URLs of entries in the project library
     let currentUrl = '';
     let currentSo  = '';
     let history    = [];
@@ -1366,8 +1533,8 @@ function getFileBrowserJs(): string {
         return String(s || '').replace(/[&<>"']/g,
             c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
-    function fileIcon(entry) {
-        if (entry.type === 'directory') return '\uD83D\uDCC1'; // folder
+    function fileIcon(entry, inLibrary) {
+        if (entry.type === 'directory') return inLibrary ? '\uD83D\uDDC2\uFE0F' : '\uD83D\uDCC1'; // 🗂️ or 📁
         const name = (entry.basename || entry.name || '').toLowerCase();
         if (/\.(py|pyx|pyi)$/.test(name))                   return '\uD83D\uDC0D'; // snake
         if (/\.(js|ts|jsx|tsx)$/.test(name))                 return '\uD83D\uDCDC'; // scroll
@@ -1381,13 +1548,240 @@ function getFileBrowserJs(): string {
     }
 
     // ── browse result ──────────────────────────────────────────────────────
+    // ── tree rendering ─────────────────────────────────────────────────────
+
+    // Sort state
+    var sortCol = 'name';   // 'name' | 'size' | 'mtime'
+    var sortAsc = true;
+    // Last browse entries (root level) — kept for re-sort without re-fetch
+    var lastBrowseEntries = [];
+
+    function sortEntries(entries) {
+        // Stable sort: directories always before files, then by chosen column
+        function key(e) {
+            if (sortCol === 'size')  return e.size  == null ? -1 : e.size;
+            if (sortCol === 'mtime') return e.last_modified == null ? 0 : parseFloat(e.last_modified);
+            // name: case-insensitive
+            return (e.basename || basename(e.name || '')).toLowerCase();
+        }
+        return entries.slice().sort(function(a, b) {
+            var aDir = a.type === 'directory' ? 0 : 1;
+            var bDir = b.type === 'directory' ? 0 : 1;
+            if (aDir !== bDir) return aDir - bDir;  // dirs before files always
+            var ak = key(a), bk = key(b);
+            var cmp = ak < bk ? -1 : ak > bk ? 1 : 0;
+            return sortAsc ? cmp : -cmp;
+        });
+    }
+
+    function updateSortHeaders() {
+        document.querySelectorAll('.fb-col-hdr').forEach(function(el) {
+            var col = el.dataset.col;
+            var arrow = el.querySelector('.fb-sort-arrow');
+            if (col === sortCol) {
+                el.classList.add('active');
+                if (arrow) arrow.textContent = sortAsc ? '\u25B4' : '\u25BE'; // ▴ ▾
+            } else {
+                el.classList.remove('active');
+                if (arrow) arrow.textContent = '';
+            }
+        });
+    }
+
+    // Wire up column header clicks
+    document.querySelectorAll('.fb-col-hdr').forEach(function(el) {
+        el.addEventListener('click', function() {
+            var col = el.dataset.col;
+            if (col === sortCol) {
+                sortAsc = !sortAsc;
+            } else {
+                sortCol = col;
+                sortAsc = col === 'name';  // name defaults asc, size/mtime default desc
+            }
+            updateSortHeaders();
+            // Re-render root entries with new sort (no network call)
+            if (lastBrowseEntries.length > 0) {
+                treeNodes = {};
+                entriesEl.innerHTML = '';
+                var sorted = sortEntries(lastBrowseEntries);
+                for (var i = 0; i < sorted.length; i++) {
+                    entriesEl.appendChild(makeEntryRow(sorted[i], 0));
+                }
+            }
+        });
+    });
+    updateSortHeaders();
+
+    // Map from directory URL -> child container element (for expand/collapse)
+    var treeNodes = {};
+
+    function makeEntryRow(entry, depth) {
+        var isDir = entry.type === 'directory';
+        var url   = entry.name;
+
+        // Outer wrapper: row + (for dirs) a children container
+        var wrapper = document.createElement('div');
+        wrapper.className = 'fb-entry-wrapper';
+
+        var row = document.createElement('div');
+        row.className = 'fb-entry' + (isDir ? ' is-dir' : '');
+        row.dataset.url  = url;
+        row.dataset.type = entry.type || 'file';
+
+        // Name cell: indent + toggle + icon + name
+        var nameCell = document.createElement('span');
+        nameCell.className = 'fb-entry-name-cell';
+
+        var indent = document.createElement('span');
+        indent.className = 'fb-entry-indent';
+        indent.style.width = (depth * 12) + 'px';
+        nameCell.appendChild(indent);
+
+        var toggle = document.createElement('span');
+        toggle.className = 'fb-entry-toggle';
+        toggle.textContent = isDir ? '\u25B6' : '';  // ▶ for dirs, blank for files
+        nameCell.appendChild(toggle);
+
+        var icon = document.createElement('span');
+        icon.className = 'fb-entry-icon';
+        icon.textContent = fileIcon(entry, isDir && libraryUrls.has(url));
+        nameCell.appendChild(icon);
+
+        var nameEl = document.createElement('span');
+        nameEl.className = 'fb-entry-name';
+        nameEl.textContent = entry.basename || basename(url);
+        nameEl.title = url;
+        nameCell.appendChild(nameEl);
+
+        // Size cell
+        var sizeEl = document.createElement('span');
+        sizeEl.className = 'fb-entry-size';
+        if (entry.size != null) sizeEl.textContent = fmtSize(entry.size);
+
+        // Modified cell
+        var mtimeEl = document.createElement('span');
+        mtimeEl.className = 'fb-entry-mtime';
+        if (entry.last_modified) mtimeEl.textContent = fmtMtime(entry.last_modified);
+
+        row.appendChild(nameCell);
+        row.appendChild(sizeEl);
+        row.appendChild(mtimeEl);
+
+        // Children container (lazy-populated)
+        var childrenEl = null;
+        if (isDir) {
+            childrenEl = document.createElement('div');
+            childrenEl.className = 'fb-children';
+            treeNodes[url] = childrenEl;
+        }
+
+        // Click: select
+        row.addEventListener('click', function(e) {
+            e.stopPropagation();
+            selectEntry(url, entry.type, row);
+        });
+
+        // Toggle click: expand/collapse (stop propagation so row click doesn't fire)
+        if (isDir) {
+            toggle.addEventListener('click', function(e) {
+                e.stopPropagation();
+                toggleDir(url, toggle, childrenEl);
+            });
+            // Double-click on row: navigate to dir as new root
+            row.addEventListener('dblclick', function(e) {
+                e.stopPropagation();
+                navigateTo(url, currentSo);
+            });
+        }
+
+        wrapper.appendChild(row);
+        if (childrenEl) wrapper.appendChild(childrenEl);
+        return wrapper;
+    }
+
+    function fmtMtime(ts) {
+        if (!ts) return '';
+        var d = new Date(parseFloat(ts) * 1000);
+        var now = new Date();
+        var diffDays = (now - d) / 86400000;
+        if (diffDays < 1) {
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+        if (diffDays < 180) {
+            return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+        }
+        return d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+
+    function toggleDir(url, toggle, childrenEl) {
+        var expanded = childrenEl.classList.contains('expanded');
+        if (expanded) {
+            // Collapse
+            childrenEl.classList.remove('expanded');
+            toggle.textContent = '\u25B6';  // ▶
+        } else {
+            // Expand: lazy-load if not yet populated
+            childrenEl.classList.add('expanded');
+            toggle.textContent = '\u25BC';  // ▼
+            if (!childrenEl.dataset.loaded) {
+                // Show loading indicator
+                var loader = document.createElement('div');
+                loader.className = 'fb-child-loading';
+                loader.textContent = 'Loading...';
+                childrenEl.appendChild(loader);
+                // Request children from host
+                vscode.postMessage({ cmd: 'expandDir', url: url, storageOptions: currentSo || undefined });
+            }
+        }
+    }
+
+    function handleExpandResult(data) {
+        var parentUrl = data.parentUrl || data.url;
+        var childrenEl = treeNodes[parentUrl];
+        if (!childrenEl) { dbg('no treeNode for ' + parentUrl); return; }
+
+        childrenEl.innerHTML = '';
+        childrenEl.dataset.loaded = '1';
+
+        if (data.error) {
+            var errEl = document.createElement('div');
+            errEl.className = 'fb-child-loading';
+            errEl.textContent = 'Error: ' + data.error;
+            childrenEl.appendChild(errEl);
+            return;
+        }
+
+        var entries = data.entries || [];
+        if (entries.length === 0) {
+            var emptyMsg = document.createElement('div');
+            emptyMsg.className = 'fb-child-loading';
+            emptyMsg.textContent = 'Empty';
+            childrenEl.appendChild(emptyMsg);
+            return;
+        }
+
+        // Find the depth of the parent by looking at the DOM
+        var parentRow = childrenEl.previousSibling;
+        var parentIndent = parentRow ? (parseInt(parentRow.querySelector('.fb-entry-indent').style.width) || 0) : 0;
+        var childDepth = Math.round(parentIndent / 12) + 1;
+
+        var sorted = sortEntries(entries);
+        for (var i = 0; i < sorted.length; i++) {
+            childrenEl.appendChild(makeEntryRow(sorted[i], childDepth));
+        }
+        dbg('expanded ' + parentUrl + ': ' + sorted.length + ' children');
+    }
+
     function renderBrowse(data) {
         dbg('renderBrowse url=' + data.url + ' entries=' + (data.entries ? data.entries.length : 'none') + ' error=' + data.error);
         currentUrl = data.url || '';
         urlInput.value = currentUrl;
         renderBreadcrumb(currentUrl);
 
-        // Clear only the entries container — never touch fb-empty/fb-error
+        // Reset tree node map and stored entries
+        treeNodes = {};
+        lastBrowseEntries = [];
+
         entriesEl.innerHTML = '';
         emptyEl.classList.add('hidden');
         errorEl.classList.add('hidden');
@@ -1398,52 +1792,18 @@ function getFileBrowserJs(): string {
             return;
         }
 
-        const entries = data.entries || [];
+        var entries = data.entries || [];
         if (entries.length === 0) {
             emptyEl.classList.remove('hidden');
             return;
         }
 
-        for (const entry of entries) {
-            const row = document.createElement('div');
-            row.className = 'fb-entry' + (entry.type === 'directory' ? ' is-dir' : '');
-            row.dataset.url  = entry.name;
-            row.dataset.type = entry.type || 'file';
-
-            const icon = document.createElement('span');
-            icon.className = 'fb-entry-icon';
-            icon.textContent = fileIcon(entry);
-
-            const name = document.createElement('span');
-            name.className = 'fb-entry-name';
-            name.textContent = entry.basename || basename(entry.name);
-            name.title = entry.name;
-
-            const meta = document.createElement('span');
-            meta.className = 'fb-entry-meta';
-            if (entry.type !== 'directory' && entry.size != null) {
-                meta.textContent = fmtSize(entry.size);
-            }
-
-            row.appendChild(icon);
-            row.appendChild(name);
-            row.appendChild(meta);
-
-            row.addEventListener('click', function(e) {
-                e.stopPropagation();
-                selectEntry(entry.name, entry.type, row);
-            });
-
-            if (entry.type === 'directory') {
-                row.addEventListener('dblclick', function(e) {
-                    e.stopPropagation();
-                    navigateTo(entry.name, currentSo);
-                });
-            }
-
-            entriesEl.appendChild(row);
+        lastBrowseEntries = entries;
+        var sorted = sortEntries(entries);
+        for (var i = 0; i < sorted.length; i++) {
+            entriesEl.appendChild(makeEntryRow(sorted[i], 0));
         }
-        dbg('rendered ' + entries.length + ' entries');
+        dbg('rendered ' + sorted.length + ' entries');
     }
 
     function selectEntry(url, type, rowEl) {
@@ -1628,6 +1988,16 @@ function getFileBrowserJs(): string {
     }
 
     // ── bookmarks ──────────────────────────────────────────────────────────
+    function refreshLibraryBadges() {
+        // Walk every directory row in the DOM and swap the folder icon
+        document.querySelectorAll('.fb-entry[data-type="directory"]').forEach(function(row) {
+            var url = row.dataset.url || '';
+            var iconEl = row.querySelector('.fb-entry-icon');
+            if (!iconEl) return;
+            iconEl.textContent = libraryUrls.has(url) ? '\uD83D\uDDC2\uFE0F' : '\uD83D\uDCC1'; // 🗂️ or 📁
+        });
+    }
+
     function renderBookmarks() {
         bmList.innerHTML = '';
         if (!bookmarks.length) {
@@ -1874,7 +2244,8 @@ function getFileBrowserJs(): string {
 
         var lib = {};
         lib[url] = proj;
-        var dataMsg = { type: 'data', library: lib, info: {}, enums: {} };
+        // Pass info and enums so spec documentation popups and enum labels work
+        var dataMsg = { type: 'data', library: lib, info: data.info || {}, enums: data.enums || {} };
 
         if (typeof window.__fbPanelDeliver === 'function') {
             dbg('delivering to embedded panel: ' + url);
@@ -1896,7 +2267,12 @@ function getFileBrowserJs(): string {
             case 'init':
                 bookmarks = msg.bookmarks || [];
                 protocols = msg.protocols || [];
-                dbg('init: ' + bookmarks.length + ' bookmarks, ' + protocols.length + ' protocols');
+                if (msg.libraryUrls) {
+                    libraryUrls = new Set(msg.libraryUrls);
+                    dbg('init: ' + bookmarks.length + ' bookmarks, ' + libraryUrls.size + ' library entries');
+                } else {
+                    dbg('init: ' + bookmarks.length + ' bookmarks, ' + protocols.length + ' protocols');
+                }
                 break;
 
             case 'browseResult':
@@ -1916,6 +2292,10 @@ function getFileBrowserJs(): string {
                 renderInspect(msg);
                 break;
 
+            case 'expandResult':
+                handleExpandResult(msg);
+                break;
+
             case 'projectScanned':
                 dbg('projectScanned url=' + msg.url + ' error=' + msg.error);
                 showProjectInPanel(msg);
@@ -1925,6 +2305,12 @@ function getFileBrowserJs(): string {
                 bookmarks = msg.bookmarks || [];
                 dbg('bookmarks updated: ' + bookmarks.length);
                 if (!bmPanel.classList.contains('hidden')) renderBookmarks();
+                break;
+
+            case 'libraryUrlsUpdated':
+                libraryUrls = new Set(msg.libraryUrls || []);
+                dbg('library URLs updated: ' + libraryUrls.size);
+                refreshLibraryBadges();
                 break;
 
             case 'error':
