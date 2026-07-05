@@ -188,7 +188,6 @@ export class FileBrowserPanel {
         } catch (e) { log('supported_protocols error: ' + e); }
         log(`prefetchInit done: ${bookmarks.length} bookmarks, ${protocols.length} protocols`);
         this.pendingInit = { bookmarks, protocols, startUrl: startUrl || os.homedir() };
-        // If 'ready' already arrived before we finished, flush now.
         if (this.readyReceived) {
             void this.sendInitialData();
         }
@@ -593,16 +592,72 @@ export class FileBrowserPanel {
         const css = getFileBrowserCss();
         const js  = getFileBrowserJs();
 
+        // Read shared panel assets from the projspec webui package on disk.
+        // Done synchronously here so the assets are in the original HTML
+        // response — all three <script nonce> blocks below carry the page
+        // nonce and are therefore allowed by the webview CSP.
+        const webuiDir = path.resolve(__dirname, '..', '..', 'src', 'projspec', 'webui');
+        let panelCss = '', panelJs = '', panelBodyHtml = '';
+        try {
+            panelJs  = fs.readFileSync(path.join(webuiDir, 'panel.js'),   'utf-8');
+            panelCss = fs.readFileSync(path.join(webuiDir, 'panel.css'),  'utf-8');
+            const rawHtml = fs.readFileSync(path.join(webuiDir, 'panel.html'), 'utf-8');
+            const icons   = JSON.parse(fs.readFileSync(path.join(webuiDir, 'chrome.json'), 'utf-8'));
+            // Substitute icon placeholders, inline CSS, remove the <script> block
+            // (we re-emit it as a separate nonce-tagged block below)
+            let html = rawHtml;
+            for (const [key, glyph] of Object.entries(icons) as [string, string][]) {
+                html = html.split(`<!--ICON:${key}-->`).join(glyph);
+            }
+            html = html.replace('/*__CSS__*/', panelCss);
+            html = html.replace('<script>/*__JS__*/</script>', '');
+            html = html.replace('<!--BOOTSTRAP-->', '');
+            const bodyStart = html.indexOf('<body>') + '<body>'.length;
+            const bodyEnd   = html.lastIndexOf('</body>');
+            panelBodyHtml = html.slice(bodyStart, bodyEnd).trim();
+            log(`panel assets: css=${panelCss.length} js=${panelJs.length} html=${panelBodyHtml.length}`);
+        } catch (e) {
+            log(`panel asset read error: ${e}`);
+        }
+
+        // Transport bootstrap: runs BEFORE panel.js so projspecTransport is
+        // set when panel.js starts. Written as a plain string so it does not
+        // contain any template-literal backticks that could confuse editors.
+        const bootstrap = '(function(){'
+            + 'var root=document.getElementById("fb-scan-panel-root");'
+            + 'if(!root)return;'
+            + 'var pending=[];'
+            + 'window.__fbPanelDeliver=function(msg){'
+            + 'if(window.__fbPanelDispatch){window.__fbPanelDispatch(msg);}'
+            + 'else{pending.push(msg);}};'
+            + 'window.projspecRoot=root;'
+            + 'window.projspecTransport={'
+            + 'send:function(){},'
+            + 'onReady:function(d){'
+            + 'window.__fbPanelDispatch=d;'
+            + 'pending.forEach(function(m){d(m);});pending=[];'
+            + 'delete window.projspecRoot;delete window.projspecTransport;'
+            + '}};'
+            + '})()';
+
+        const pageBody = FB_HTML_BODY.replace(
+            '<div id="fb-scan-panel-root"></div>',
+            `<div id="fb-scan-panel-root">${panelBodyHtml}</div>`
+        );
+
         return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
-<style>${css}</style>
+<style>${css}
+${panelCss}</style>
 <title>File Browser</title>
 </head>
 <body>
-${FB_HTML_BODY}
+${pageBody}
+<script nonce="${nonce}">${bootstrap}</script>
+<script nonce="${nonce}">${panelJs}</script>
 <script nonce="${nonce}">${js}</script>
 </body>
 </html>`;
@@ -685,15 +740,10 @@ const FB_HTML_BODY = `
     <div id="fb-info-top">
       <div id="fb-info-meta"></div>
       <div id="fb-info-preview"></div>
-    </div>
-    <div id="fb-scan-pane" class="hidden">
-      <div id="fb-scan-header">
-        <span id="fb-scan-title">&#128202; projspec scan</span>
-        <span id="fb-scan-status"></span>
-      </div>
-      <div id="fb-scan-chips"></div>
-      <div id="fb-scan-details"></div>
-    </div>
+     </div>
+     <div id="fb-scan-pane" class="hidden">
+       <div id="fb-scan-panel-root"></div>
+     </div>
   </div>
 
 </div>
@@ -806,41 +856,35 @@ body { margin: 0; padding: 0;
   overflow: hidden;
   min-height: 0;
 }
-#fb-scan-header {
+#fb-scan-panel-root {
+  flex: 1;
+  overflow: hidden;
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--vscode-panel-border);
-  font-weight: 600;
-  font-size: 12px;
-  flex-shrink: 0;
+  flex-direction: column;
 }
-#fb-scan-status { font-weight: normal; color: var(--vscode-descriptionForeground); font-size: 11px; }
-#fb-scan-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--vscode-panel-border);
-  flex-shrink: 0;
+#fb-scan-panel-root #app {
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
 }
-#fb-scan-details { flex: 1; overflow-y: auto; padding: 8px 12px; }
-.fb-chip {
-  display: inline-flex; align-items: center; padding: 2px 8px;
-  border-radius: 10px; font-size: 11px; cursor: pointer;
-  border: 1px solid transparent; user-select: none; color: #222;
+#fb-scan-panel-root #library {
+  width: 100% !important;
+  max-width: 100% !important;
+  border-right: none !important;
+  flex: 0 0 auto;
+  max-height: 50%;
+  overflow: hidden;
 }
-.fb-chip:hover { filter: brightness(0.92); }
-.fb-chip.active { border-color: var(--vscode-focusBorder); }
-.scan-item {
-  border: 1px solid var(--vscode-panel-border); border-radius: 3px;
-  margin-bottom: 4px; padding: 4px 8px; font-size: 11px;
+#fb-scan-panel-root .toolbar,
+#fb-scan-panel-root .search,
+#fb-scan-panel-root #spinner { display: none !important; }
+#fb-scan-panel-root #projects { flex: 1; overflow-y: auto; padding: 4px; }
+#fb-scan-panel-root #details {
+  flex: 1;
+  border-top: 1px solid var(--vscode-panel-border);
+  overflow: hidden;
+  min-height: 0;
 }
-.scan-item-title { font-weight: 600; margin-bottom: 2px; }
-.scan-kv { display: flex; gap: 6px; flex-wrap: wrap; }
-.scan-k { color: var(--vscode-descriptionForeground); min-width: 80px; }
-.scan-v { word-break: break-all; }
 
 /* toolbar */
 #fb-toolbar {
@@ -1268,8 +1312,7 @@ function getFileBrowserJs(): string {
     const infoPreview = document.getElementById('fb-info-preview');
     const scanPane    = document.getElementById('fb-scan-pane');
     const scanStatus  = document.getElementById('fb-scan-status');
-    const scanChips   = document.getElementById('fb-scan-chips');
-    const scanDetails = document.getElementById('fb-scan-details');
+    const scanPanelRoot = document.getElementById('fb-scan-panel-root');
     const bmPanel     = document.getElementById('bm-panel');
     const bmList      = document.getElementById('bm-list');
     const soOverlay   = document.getElementById('so-overlay');
@@ -1422,9 +1465,7 @@ function getFileBrowserJs(): string {
         // Always hide and reset the scan pane when selection changes
         if (scanPane) {
             scanPane.classList.add('hidden');
-            if (scanChips)   scanChips.innerHTML = '';
-            if (scanDetails) scanDetails.innerHTML = '';
-            if (scanStatus)  scanStatus.textContent = '';
+            if (scanStatus) scanStatus.textContent = '';
         }
 
         if (isFile) {
@@ -1814,119 +1855,33 @@ function getFileBrowserJs(): string {
         if (e.target === renOverlay) renOverlay.classList.add('hidden');
     });
 
-    // ── projspec scan rendering ────────────────────────────────────────────
-    const PALETTE = [
-        '#f9c0c0','#f9dcc0','#f9f0c0','#d9f9c0','#c0f9d2',
-        '#c0f9f0','#c0e3f9','#c0ccf9','#d6c0f9','#efc0f9',
-        '#f9c0e3','#d9c9b5','#b5d9c9','#b5c9d9','#c9b5d9',
-    ];
-    function hashStr(s) {
-        let h = 0;
-        for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
-        return Math.abs(h);
-    }
-    function chipColour(label) { return PALETTE[hashStr(label) % PALETTE.length]; }
+    // ── embedded projspec panel ────────────────────────────────────────────
+    // The shared panel JS was already run by the inline bootstrap script in
+    // getHtml() before this IIFE executed.  The bootstrap installed
+    // window.__fbPanelDeliver(msg) — call it to push a data message into
+    // the embedded panel.
 
-    function renderProjectScan(data) {
-        if (!scanChips || !scanDetails || !scanStatus) return;
-        scanChips.innerHTML = '';
-        scanDetails.innerHTML = '';
-        if (data.error) {
-            scanStatus.textContent = data.error;
-            return;
-        }
-        const proj = data.project;
-        if (!proj) { scanStatus.textContent = 'no project data'; return; }
+    function showProjectInPanel(data) {
+        if (!scanPanelRoot) return;
+        if (scanStatus) scanStatus.textContent = '';
 
-        const specs = proj.specs || {};
-        const specNames = Object.keys(specs);
-        if (specNames.length === 0) {
-            scanStatus.textContent = 'no specs found';
-            const msg = document.createElement('div');
-            msg.style.cssText = 'color:var(--vscode-descriptionForeground);font-size:12px;font-style:italic;padding:4px 0;';
-            msg.textContent = 'No project specs detected in this directory.';
-            scanDetails.appendChild(msg);
+        var proj = data.project;
+        var url  = data.url || '';
+        if (!proj) {
+            if (scanStatus) scanStatus.textContent = data.error || 'no project data';
             return;
         }
 
-        scanStatus.textContent = specNames.length + ' spec' + (specNames.length !== 1 ? 's' : '');
+        var lib = {};
+        lib[url] = proj;
+        var dataMsg = { type: 'data', library: lib, info: {}, enums: {} };
 
-        let activeChip = null;
-        function showSpec(name) {
-            scanDetails.innerHTML = '';
-            if (activeChip) activeChip.classList.remove('active');
-            const spec = specs[name];
-            if (!spec) return;
-            renderSpecItems(scanDetails, spec._contents || {}, 'Content');
-            renderSpecItems(scanDetails, spec._artifacts || {}, 'Artifact');
+        if (typeof window.__fbPanelDeliver === 'function') {
+            dbg('delivering to embedded panel: ' + url);
+            window.__fbPanelDeliver(dataMsg);
+        } else {
+            dbg('ERROR: __fbPanelDeliver not available');
         }
-
-        for (var i = 0; i < specNames.length; i++) {
-            const name = specNames[i];
-            const chip = document.createElement('span');
-            chip.className = 'fb-chip';
-            chip.style.background = chipColour(name);
-            chip.textContent = name;
-            (function(n, c) {
-                c.addEventListener('click', function() {
-                    activeChip = c; c.classList.add('active'); showSpec(n);
-                });
-            })(name, chip);
-            scanChips.appendChild(chip);
-        }
-        // Auto-show first
-        const firstChip = scanChips.querySelector('.fb-chip');
-        if (firstChip) { activeChip = firstChip; firstChip.classList.add('active'); }
-        if (specNames.length > 0) showSpec(specNames[0]);
-    }
-
-    function renderSpecItems(container, items, kindLabel) {
-        const keys = Object.keys(items);
-        for (var i = 0; i < keys.length; i++) {
-            renderOneItem(container, keys[i], items[keys[i]], kindLabel);
-        }
-    }
-
-    function renderOneItem(container, typeName, val, kindLabel) {
-        if (!val) return;
-        if (Array.isArray(val)) {
-            for (var i = 0; i < val.length; i++) renderOneItem(container, typeName, val[i], kindLabel);
-            return;
-        }
-        if (typeof val === 'object') {
-            if ('klass' in val) {
-                appendItemCard(container, typeName, null, val, kindLabel);
-            } else {
-                const names = Object.keys(val);
-                for (var j = 0; j < names.length; j++) {
-                    appendItemCard(container, typeName, names[j], val[names[j]], kindLabel);
-                }
-            }
-        }
-    }
-
-    function appendItemCard(container, typeName, itemName, data, kindLabel) {
-        const card = document.createElement('div');
-        card.className = 'scan-item';
-        const title = document.createElement('div');
-        title.className = 'scan-item-title';
-        title.textContent = kindLabel + ': ' + typeName + (itemName ? ' \u2014 ' + itemName : '');
-        card.appendChild(title);
-        if (data && typeof data === 'object') {
-            const kv = document.createElement('div');
-            kv.className = 'scan-kv';
-            const entries = Object.entries(data);
-            for (var i = 0; i < entries.length; i++) {
-                const k = entries[i][0], v = entries[i][1];
-                if (k === 'klass') continue;
-                const kEl = document.createElement('span'); kEl.className = 'scan-k'; kEl.textContent = k + ':';
-                const vEl = document.createElement('span'); vEl.className = 'scan-v';
-                vEl.textContent = typeof v === 'object' ? JSON.stringify(v) : String(v == null ? '' : v);
-                kv.appendChild(kEl); kv.appendChild(vEl);
-            }
-            card.appendChild(kv);
-        }
-        container.appendChild(card);
     }
 
     // ── message bus ────────────────────────────────────────────────────────
@@ -1945,8 +1900,6 @@ function getFileBrowserJs(): string {
                 break;
 
             case 'browseResult':
-                // Keep currentSo in sync with the storage options that were
-                // used for this browse (the host echoes them back).
                 if (typeof msg.storageOptions === 'string') {
                     currentSo = msg.storageOptions;
                 }
@@ -1965,8 +1918,7 @@ function getFileBrowserJs(): string {
 
             case 'projectScanned':
                 dbg('projectScanned url=' + msg.url + ' error=' + msg.error);
-                if (scanStatus) scanStatus.textContent = '';
-                renderProjectScan(msg);
+                showProjectInPanel(msg);
                 break;
 
             case 'bookmarksUpdated':
