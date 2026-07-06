@@ -946,7 +946,7 @@ const FB_HTML_BODY = `
 // ---------------------------------------------------------------------------
 // CSS
 // ---------------------------------------------------------------------------
-function getFileBrowserCss(): string {
+export function getFileBrowserCss(): string {
     return `
 /* reset / base */
 *, *::before, *::after { box-sizing: border-box; }
@@ -1408,6 +1408,34 @@ body { margin: 0; padding: 0;
 .intake-key { font-weight: 600; min-width: 80px; }
 .intake-val { word-break: break-all; }
 
+.fc-reader-details {
+  margin-top: 6px;
+  border-top: 1px solid var(--vscode-panel-border);
+  padding-top: 4px;
+}
+.fc-reader-summary {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+}
+.fc-reader-summary::-webkit-details-marker { display: none; }
+.fc-reader-summary::before {
+  content: '\\25B6';
+  font-size: 8px;
+  transition: transform 0.15s;
+}
+details[open] > .fc-reader-summary::before { transform: rotate(90deg); }
+.fc-reader-details .fc-kv { margin-top: 3px; }
+
 /* Bookmarks panel */
 #bm-panel {
   position: absolute;
@@ -1553,7 +1581,7 @@ body { margin: 0; padding: 0;
 // ---------------------------------------------------------------------------
 // JavaScript
 // ---------------------------------------------------------------------------
-function getFileBrowserJs(): string {
+export function getFileBrowserJs(): string {
     return String.raw`
 (function() {
     // Proof-of-life: visible immediately if the script block executes at all
@@ -2405,19 +2433,41 @@ function getFileBrowserJs(): string {
                 }
             }
 
-            // Metadata key-values — skip html_repr/thumbnail (already rendered above)
+            // Metadata key-values — skip html_repr/thumbnail (already rendered above).
+            // reader_* / readers* fields are collected into a collapsible box at the end.
             var SKIP_META = new Set(['html_repr', 'thumbnail']);
             var mkeys = Object.keys(meta);
+            var readerRows = [];
             for (var mi = 0; mi < mkeys.length; mi++) {
                 var mk = mkeys[mi], mv = meta[mk];
                 if (SKIP_META.has(mk) || mv == null) continue;
                 var mvStr = typeof mv === 'object' ? JSON.stringify(mv) : String(mv);
                 if (!mvStr || mvStr === '{}' || mvStr === '[]') continue;
+                if (/^readers?(_|$)/i.test(mk)) {
+                    readerRows.push([mk, mvStr]);
+                    continue;
+                }
                 var kvEl = document.createElement('div');
                 kvEl.className = 'fc-kv';
                 kvEl.innerHTML = '<span class="fc-k">' + escHtml(mk) + ':</span>'
                     + '<span class="fc-v">' + escHtml(mvStr) + '</span>';
                 card.appendChild(kvEl);
+            }
+            if (readerRows.length > 0) {
+                var det = document.createElement('details');
+                det.className = 'fc-reader-details';
+                var sum = document.createElement('summary');
+                sum.className = 'fc-reader-summary';
+                sum.textContent = 'Reader info';
+                det.appendChild(sum);
+                for (var ri = 0; ri < readerRows.length; ri++) {
+                    var rkvEl = document.createElement('div');
+                    rkvEl.className = 'fc-kv';
+                    rkvEl.innerHTML = '<span class="fc-k">' + escHtml(readerRows[ri][0]) + ':</span>'
+                        + '<span class="fc-v">' + escHtml(readerRows[ri][1]) + '</span>';
+                    det.appendChild(rkvEl);
+                }
+                card.appendChild(det);
             }
 
             // Structure tags (e.g. ["table"])

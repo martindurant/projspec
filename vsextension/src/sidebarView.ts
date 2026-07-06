@@ -14,8 +14,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this.getHtml();
         webviewView.webview.onDidReceiveMessage((msg) => {
             if (msg.cmd === 'open') {
+                // Opens combined panel on the Library tab
                 vscode.commands.executeCommand('projspec.showTree');
             } else if (msg.cmd === 'openFileBrowser') {
+                // Opens combined panel on the File Browser tab
                 vscode.commands.executeCommand('projspec.openFileBrowserHere');
             }
         });

@@ -21,7 +21,8 @@
     "commands": [
       {
         "command": "projspec.showTree",
-        "title": "Project Library"
+        "title": "Open projspec Panel",
+        "category": "projspec"
       },
       {
         "command": "projspec.openFileBrowser",
