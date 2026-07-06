@@ -37,11 +37,13 @@ test = ["pytest", "pytest-cov", "django", "streamlit", "copier", "jinja2-time", 
 qt = ["pyqt>5,<6", "pyqtwebengin>5,<6"]
 textual = ["textual>=0.80"]
 ipywidget = ["anywidget>=0.9"]
+serve = ["fastapi>=0.100", "uvicorn[standard]>=0.23"]
 
 [project.scripts]
 projspec = "projspec.__main__:main"
 projspec-qt = "projspec.qtapp.main:main"
 projspec-tui = "projspec.textapp.main:main"
+projspec-server = "projspec.server:main"
 
 [tool.poetry.extras]
 po_test = ["pytest"]

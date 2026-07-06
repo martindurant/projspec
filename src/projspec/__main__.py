@@ -522,5 +522,45 @@ def fb_bookmarks_remove(url):
     print(json.dumps(bookmark_remove(url)))
 
 
+@main.command("serve")
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Interface to bind the server to.",
+)
+@click.option(
+    "--port",
+    default=0,
+    show_default=True,
+    type=int,
+    help="TCP port (0 = pick a free port automatically).",
+)
+@click.option(
+    "--port-file",
+    default=None,
+    type=click.Path(dir_okay=False, writable=True),
+    help=(
+        "If given, write the chosen port number to this file once the server "
+        "is ready.  Useful for callers that need to discover a dynamically "
+        "assigned port."
+    ),
+)
+def serve(host, port, port_file):
+    """Start the projspec HTTP server (requires fastapi + uvicorn).
+
+    The server exposes all projspec and filebrowser operations as JSON
+    endpoints so that callers (e.g. the VS Code extension) can avoid the
+    overhead of spawning a new Python process for each operation.
+
+    Install the required extras with:
+
+        pip install 'projspec[serve]'
+    """
+    from projspec.server import run
+
+    run(host=host, port=port, port_file=port_file)
+
+
 if __name__ == "__main__":
     main()
