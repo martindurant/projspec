@@ -175,7 +175,7 @@
                 : 'No projects match the filter.';
             projectsEl.appendChild(e);
         }
-        if (selection) renderDetails();
+        renderDetails();
     }
 
     function renderProject(url, project) {

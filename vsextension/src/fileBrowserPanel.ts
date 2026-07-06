@@ -2443,7 +2443,7 @@ export function getFileBrowserJs(): string {
                 if (SKIP_META.has(mk) || mv == null) continue;
                 var mvStr = typeof mv === 'object' ? JSON.stringify(mv) : String(mv);
                 if (!mvStr || mvStr === '{}' || mvStr === '[]') continue;
-                if (/^readers?(_|$)/i.test(mk)) {
+                if (/^readers?(_|$)/i.test(mk) || mk === 'errors') {
                     readerRows.push([mk, mvStr]);
                     continue;
                 }
