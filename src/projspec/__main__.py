@@ -377,6 +377,23 @@ def fb_inspect(url, storage_options, max_text_bytes):
     )
 
 
+@filebrowser.command("inspect-as-project")
+@click.argument("url")
+@click.option("--storage-options", default="", help="fsspec storage options as JSON")
+def fb_inspect_as_project(url, storage_options):
+    """Inspect a file and return a project-shaped dict for the UI scan panel.
+
+    Outputs JSON with the same shape as ``projspec scan --json-out`` so the
+    file browser's embedded scan panel can render it identically to a directory
+    scan.  Keys: url, project, name, size, last_modified, mime_type,
+    text_preview, error.
+    """
+    from projspec.filebrowser import inspect_as_project
+
+    so = json.loads(storage_options) if storage_options.strip() else None
+    print(json.dumps(inspect_as_project(url, storage_options=so)))
+
+
 @filebrowser.command("read-file")
 @click.argument("url")
 @click.option("--storage-options", default="", help="fsspec storage options as JSON")

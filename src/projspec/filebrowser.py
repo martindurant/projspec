@@ -42,12 +42,62 @@ Public interface (called via ``projspec filebrowser ...`` CLI)
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
 
 import fsspec
+
+# ---------------------------------------------------------------------------
+# File-based logger — same config directory as server.py so all Python-side
+# projspec activity is visible together.
+# ---------------------------------------------------------------------------
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("projspec.filebrowser")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    conf_dir = Path(
+        os.environ.get("PROJSPEC_CONFIG_DIR", Path.home() / ".config" / "projspec")
+    )
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    log_path = conf_dir / "filebrowser.log"
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+
+_log = _get_logger()
+
+
+def _log_call(fn_name: str, url: str, so: Any = None, **extra: Any) -> None:
+    parts = [f"CALL {fn_name} url={url!r}"]
+    if so:
+        parts.append(f"so={json.dumps(so)[:80]}")
+    for k, v in extra.items():
+        parts.append(f"{k}={v!r}"[:60])
+    _log.info(" ".join(parts))
+
+
+def _log_result(fn_name: str, url: str, result: Any, t0: float) -> None:
+    ms = int((time.monotonic() - t0) * 1000)
+    if isinstance(result, dict):
+        err = result.get("error")
+        summary = f"error={err!r}" if err else f"keys={list(result.keys())[:6]}"
+    elif isinstance(result, list):
+        summary = f"len={len(result)}"
+    else:
+        summary = repr(result)[:80]
+    _log.info(f"DONE  {fn_name} url={url!r} ({ms}ms) {summary}")
+
 
 # ---------------------------------------------------------------------------
 # Bookmark persistence
@@ -225,16 +275,16 @@ def browse(url: str, storage_options: dict | None = None) -> dict:
             "error": null or <error message>,
         }
     """
+    _log_call("browse", url, storage_options)
+    t0 = time.monotonic()
     try:
         fs, path = _get_fs(url, storage_options)
         try:
             raw = fs.ls(path, detail=True)
         except NotADirectoryError:
-            # Treat as a single-file listing
             info = fs.info(path)
             raw = [info]
         entries = [_entry_info(fs, e) for e in raw]
-        # Sort: directories first, then files, both alphabetically
         entries.sort(
             key=lambda e: (0 if e["type"] == "directory" else 1, e["basename"].lower())
         )
@@ -245,14 +295,21 @@ def browse(url: str, storage_options: dict | None = None) -> dict:
             if isinstance(fs.protocol, str)
             else (fs.protocol[0] if fs.protocol else "file")
         )
-        return {
+        result = {
             "url": canonical,
             "entries": entries,
             "parent": parent_path,
             "protocol": protocol,
             "error": None,
         }
+        _log.info(
+            f"DONE  browse url={url!r} ({int((time.monotonic()-t0)*1000)}ms) entries={len(entries)}"
+        )
+        return result
     except Exception as exc:
+        _log.error(
+            f"ERR   browse url={url!r} ({int((time.monotonic()-t0)*1000)}ms): {exc}"
+        )
         return {
             "url": url,
             "entries": [],
@@ -843,8 +900,13 @@ def inspect_as_project(
     Returns the same keys as ``scan_directory`` plus the raw inspect
     fields for the top-half metadata strip.
     """
+    _log_call("inspect_as_project", url, storage_options)
+    t0 = time.monotonic()
     result = inspect_file(url, storage_options=storage_options)
     if result.get("error"):
+        _log.error(
+            f"ERR   inspect_as_project url={url!r} ({int((time.monotonic()-t0)*1000)}ms): {result['error']}"
+        )
         return {
             "url": url,
             "project": None,
@@ -941,7 +1003,7 @@ def inspect_as_project(
         "scanned_at": None,
     }
 
-    return {
+    _ret = {
         "url": url,
         "project": project,
         # Top-level fields for the inspectResult / renderMeta strip
@@ -953,6 +1015,11 @@ def inspect_as_project(
         "text_preview": text_preview,
         "error": None,
     }
+    _log.info(
+        f"DONE  inspect_as_project url={url!r} ({int((time.monotonic()-t0)*1000)}ms) "
+        f"project={_ret['project'] is not None} mime={mime!r}"
+    )
+    return _ret
 
 
 def supported_protocols() -> list[str]:
@@ -979,15 +1046,25 @@ def scan_directory(
             "error": null or <error message>,
         }
     """
+    _log_call("scan_directory", url, storage_options)
+    t0 = time.monotonic()
     try:
         from projspec.proj import Project
 
         so = storage_options or {}
         proj = Project(url, storage_options=so, walk=False)
-        return {
+        result = {
             "url": url,
             "project": proj.to_dict(compact=False),
             "error": None,
         }
+        _log.info(
+            f"DONE  scan_directory url={url!r} ({int((time.monotonic()-t0)*1000)}ms) "
+            f"specs={list(proj.specs.keys())}"
+        )
+        return result
     except Exception as exc:
+        _log.error(
+            f"ERR   scan_directory url={url!r} ({int((time.monotonic()-t0)*1000)}ms): {exc}"
+        )
         return {"url": url, "project": None, "error": str(exc)}

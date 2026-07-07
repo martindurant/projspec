@@ -44,11 +44,15 @@ POST /filebrowser/bookmarks/remove → {"url": str}
 from __future__ import annotations
 
 import json
+import logging
+import os
 import threading
+import time
+from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel
 except ImportError as _e:  # pragma: no cover
@@ -58,10 +62,76 @@ except ImportError as _e:  # pragma: no cover
     ) from _e
 
 # ---------------------------------------------------------------------------
+# File-based logger — writes to the projspec config dir so the PyCharm and
+# VS Code plugins can read the same file as the Python-side server logs.
+# ---------------------------------------------------------------------------
+
+
+def _log_path() -> Path:
+    conf_dir = Path(
+        os.environ.get("PROJSPEC_CONFIG_DIR", Path.home() / ".config" / "projspec")
+    )
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    return conf_dir / "server.log"
+
+
+def _setup_logging() -> logging.Logger:
+    logger = logging.getLogger("projspec.server")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    fh = logging.FileHandler(_log_path(), mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
+
+
+_log = _setup_logging()
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="projspec", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def _log_requests(request: Request, call_next):
+    """Log every request and response with timing."""
+    t0 = time.monotonic()
+    _log.info(
+        "REQ  %s %s body=%db",
+        request.method,
+        request.url.path,
+        int(request.headers.get("content-length", 0)),
+    )
+    try:
+        response = await call_next(request)
+        ms = int((time.monotonic() - t0) * 1000)
+        _log.info(
+            "RESP %s %s -> %d (%dms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            ms,
+        )
+        return response
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        _log.error(
+            "ERR  %s %s -> exception %s (%dms)",
+            request.method,
+            request.url.path,
+            exc,
+            ms,
+        )
+        raise
 
 
 # Serialise to JSON ourselves so NaN/Infinity in Python floats become null
@@ -380,12 +450,7 @@ def fb_bookmark_remove(req: BookmarkRemoveRequest):
 
 
 def run(host: str = "127.0.0.1", port: int = 0, port_file: str | None = None) -> None:
-    """Start the uvicorn server.
-
-    If *port* is 0 a free port is chosen automatically.  When *port_file* is
-    given the chosen port number is written to that path as a plain integer
-    string so the caller can discover it.
-    """
+    """Start the uvicorn server."""
     import socket
     import uvicorn
 
@@ -394,14 +459,17 @@ def run(host: str = "127.0.0.1", port: int = 0, port_file: str | None = None) ->
             s.bind((host, 0))
             port = s.getsockname()[1]
 
+    _log.info("SERVER starting on %s:%d — log: %s", host, port, _log_path())
+
     if port_file:
         import os
 
         os.makedirs(os.path.dirname(os.path.abspath(port_file)), exist_ok=True)
         with open(port_file, "w") as fh:
             fh.write(str(port))
+        _log.info("SERVER port file written: %s", port_file)
 
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 def main() -> None:

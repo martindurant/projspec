@@ -1,14 +1,10 @@
-"""Qt-based desktop UI for projspec - functional equivalent of the VSCode extension.
+"""Qt-based desktop UI for projspec — two-tab panel: Library + File Browser.
 
-This app is a Python port of the `vsextension/` WebView UI.  A single
-QMainWindow hosts a QWebEngineView rendering the same HTML/CSS/JS two-pane
-layout (Library + Details) described in `vsextension/ACTIONS.md`, while the
-Python side plays the role of the "extension host": it calls projspec APIs
-directly (no subprocess), scans/creates/removes projects, and invokes
-artifacts' ``make`` methods.
-
-The look-and-feel is intentionally identical to the VSCode extension so the
-two UIs diverge as little as possible.
+A single QMainWindow hosts a QWebEngineView rendering the combined
+HTML/CSS/JS panel with a *Project Library* tab and a *File Browser* tab.
+Python plays the role of the "extension host": it calls projspec and
+filebrowser APIs directly (no subprocess) and communicates with both tabs
+via two separate QWebChannel bridge objects.
 """
 
 from __future__ import annotations
@@ -50,7 +46,7 @@ except ImportError:
     warnings.warn("PyQt5 not installed", ImportWarning)
     qt = False
 
-from projspec.qtapp.views import get_panel_html
+from projspec.qtapp.views import get_qt_html
 
 
 library = ProjectLibrary()
@@ -99,7 +95,7 @@ class JsBridge(QObject):
 
 
 class ProjspecWindow(QMainWindow):
-    """Single-window Qt app that mirrors the VSCode Project Library panel."""
+    """Single-window Qt app: Project Library tab + File Browser tab."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -109,18 +105,21 @@ class ProjspecWindow(QMainWindow):
         self._info_data: dict = {}
         self._enum_members: dict = {}
 
-        # Bridge + webview
+        # ── Library bridge ───────────────────────────────────────────────────
         self._bridge = JsBridge(self)
-        self._bridge.set_handler(self._on_message)
+        self._bridge.set_handler(self._on_lib_message)
+
+        # ── File-browser bridge ──────────────────────────────────────────────
+        self._fb_bridge = JsBridge(self)
+        self._fb_bridge.set_handler(self._on_fb_message)
+
+        # ── Webview + channel ────────────────────────────────────────────────
         self._view = QWebEngineView(self)
         channel = QWebChannel(self._view.page())
         channel.registerObject("bridge", self._bridge)
+        channel.registerObject("fb_bridge", self._fb_bridge)
         self._view.page().setWebChannel(channel)
 
-        # Qt WebEngine's default settings block a ``file://`` page from
-        # loading webfonts referenced by ``data:`` URIs in its CSS.
-        # Flipping these three switches tells Chromium to treat the page
-        # the same way it would an HTTP page so ``@font-face`` resolves.
         settings = self._view.settings()
         for attr in (
             "LocalContentCanAccessRemoteUrls",
@@ -143,26 +142,20 @@ class ProjspecWindow(QMainWindow):
         layout.addWidget(self._view)
         self.setCentralWidget(central)
 
-        # Load the shared HTML UI.  We write to a temp file and ``setUrl``
-        # it rather than calling ``setHtml``: the latter gives the page an
-        # opaque origin that Chromium treats like a cross-origin document,
-        # breaking anything that touches the page origin (external links,
-        # relative anchors, future ``fetch`` calls).  Loading from a real
-        # ``file://`` URL sidesteps all of that.
+        # Write the combined HTML to a temp file and load via file:// URL.
         import tempfile
 
         tmp = tempfile.NamedTemporaryFile(
             "w", suffix=".html", delete=False, encoding="utf-8"
         )
-        tmp.write(get_panel_html())
+        tmp.write(get_qt_html())
         tmp.close()
-        self._html_tempfile = tmp.name  # keep alive for Qt's loader
+        self._html_tempfile = tmp.name
         self._view.setUrl(QUrl.fromLocalFile(tmp.name))
-
-        # Kick off the initial load after the page has finished rendering.
         self._view.loadFinished.connect(self._on_load_finished)
 
-        self._busy = 0
+        self._lib_busy = 0
+        self._fb_busy = 0
 
     def closeEvent(self, event) -> None:  # - Qt naming
         """Remove the temp HTML file on window close."""
@@ -172,59 +165,93 @@ class ProjspecWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
-    # ── Busy indicator ──────────────────────────────────────────────────────
+    # ── Busy indicators ─────────────────────────────────────────────────────
 
     def _set_busy(self, busy: bool) -> None:
-        """Tell the webview whether any in-flight operation is running.
-
-        Uses a reference count so composed actions (scan + reload) keep the
-        spinner up rather than flashing off between steps.
-        """
         if busy:
-            self._busy += 1
-            if self._busy == 1:
+            self._lib_busy += 1
+            if self._lib_busy == 1:
                 self._bridge.send({"type": "loading", "loading": True})
         else:
-            self._busy = max(0, self._busy - 1)
-            if self._busy == 0:
+            self._lib_busy = max(0, self._lib_busy - 1)
+            if self._lib_busy == 0:
                 self._bridge.send({"type": "loading", "loading": False})
+
+    def _set_fb_busy(self, busy: bool) -> None:
+        if busy:
+            self._fb_busy += 1
+            if self._fb_busy == 1:
+                self._fb_bridge.send({"type": "loading", "loading": True})
+        else:
+            self._fb_busy = max(0, self._fb_busy - 1)
+            if self._fb_busy == 0:
+                self._fb_bridge.send({"type": "loading", "loading": False})
 
     # ── Initial load ────────────────────────────────────────────────────────
 
     def _on_load_finished(self, ok: bool) -> None:  # - signal arg
         self._reload(initial=True)
+        self._fb_init()
 
-    def _reload(self, initial: bool = False) -> None:
+    def _reload(self, initial: bool = False, select_url: str | None = None) -> None:
         self._set_busy(True)
         try:
             if initial or not self._info_data:
                 self._info_data = class_infos()
                 self._enum_members = _collect_enum_members()
-            library.load()  # re-read the on-disk library file
+            library.load()
             lib_dict = {
                 url: proj.to_dict(compact=False)
                 for url, proj in library.entries.items()
             }
-            self._bridge.send(
-                {
-                    "type": "data",
-                    "info": self._info_data,
-                    "enums": self._enum_members,
-                    "library": lib_dict,
-                }
-            )
+            msg: dict = {
+                "type": "data",
+                "info": self._info_data,
+                "enums": self._enum_members,
+                "library": lib_dict,
+            }
+            if select_url:
+                msg["selectUrl"] = select_url
+            self._bridge.send(msg)
         except Exception as e:
             QMessageBox.warning(self, "projspec", f"Reload failed: {e}")
         finally:
             self._set_busy(False)
 
-    # ── Inbound message dispatcher ──────────────────────────────────────────
+    def _fb_init(self) -> None:
+        """Send initial data to the file browser tab."""
+        import os
+        from projspec.filebrowser import (
+            bookmarks_list,
+            supported_protocols,
+        )
 
-    def _on_message(self, msg: dict) -> None:
+        self._set_fb_busy(True)
+        try:
+            bms = bookmarks_list()
+            protos = supported_protocols()
+            lib_urls = list(library.entries.keys())
+            self._fb_bridge.send(
+                {
+                    "type": "init",
+                    "bookmarks": bms,
+                    "protocols": protos,
+                    "libraryUrls": lib_urls,
+                }
+            )
+            # Navigate to home directory
+            self._fb_browse(os.path.expanduser("~"), push_history=False)
+        except Exception as e:
+            self._fb_bridge.send({"type": "error", "message": str(e)})
+        finally:
+            self._set_fb_busy(False)
+
+    # ── Library message dispatcher ──────────────────────────────────────────
+
+    def _on_lib_message(self, msg: dict) -> None:
         cmd = msg.get("cmd")
         try:
             if cmd == "ready":
-                # Webview is up and re-asking for data.
                 self._reload(initial=True)
             elif cmd == "reload":
                 self._reload()
@@ -260,6 +287,64 @@ class ProjspecWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "projspec", f"{cmd}: {e}")
 
+    # ── Filebrowser message dispatcher ──────────────────────────────────────
+
+    def _on_fb_message(self, msg: dict) -> None:
+        cmd = msg.get("cmd")
+        try:
+            if cmd == "ready":
+                self._fb_init()
+            elif cmd == "browse":
+                self._fb_browse(
+                    msg["url"],
+                    storage_options=msg.get("storageOptions") or None,
+                    push_history=msg.get("push", True),
+                )
+            elif cmd == "inspect":
+                self._fb_inspect(msg["url"], msg.get("storageOptions") or None)
+            elif cmd == "scanDir":
+                self._fb_scan_dir(msg["url"], msg.get("storageOptions") or None)
+            elif cmd == "expandDir":
+                self._fb_expand_dir(msg["url"], msg.get("storageOptions") or None)
+            elif cmd == "openFile":
+                self._fb_open_file(msg["url"], msg.get("storageOptions") or None)
+            elif cmd == "writeFile":
+                self._fb_write_file(
+                    msg["url"], msg["content"], msg.get("storageOptions") or None
+                )
+            elif cmd == "createFile":
+                self._fb_create_file(
+                    msg["parentUrl"], msg["name"], msg.get("storageOptions") or None
+                )
+            elif cmd == "deleteEntry":
+                self._fb_delete_entry(
+                    msg["url"],
+                    msg.get("isDir", False),
+                    msg.get("storageOptions") or None,
+                )
+            elif cmd == "renameEntry":
+                self._fb_rename_entry(
+                    msg["url"], msg["newName"], msg.get("storageOptions") or None
+                )
+            elif cmd == "mkdir":
+                self._fb_mkdir(
+                    msg["parentUrl"], msg["name"], msg.get("storageOptions") or None
+                )
+            elif cmd == "addBookmark":
+                self._fb_bookmark_add(
+                    msg["url"], msg.get("label"), msg.get("storageOptions") or None
+                )
+            elif cmd == "removeBookmark":
+                self._fb_bookmark_remove(msg["url"])
+            elif cmd == "addToLibrary":
+                self._fb_add_to_library(msg["url"], msg.get("storageOptions") or None)
+            elif cmd == "goToUrl":
+                self._fb_browse(
+                    msg["url"], msg.get("storageOptions") or None, push_history=True
+                )
+        except Exception as e:
+            self._fb_bridge.send({"type": "error", "message": str(e)})
+
     # ── Actions ─────────────────────────────────────────────────────────────
 
     def _action_add(self) -> None:
@@ -289,7 +374,11 @@ class ProjspecWindow(QMainWindow):
         if tool == "vscode":
             _spawn_detached(["code", local])
         elif tool == "filebrowser":
-            _open_with_default(local)
+            # Switch to the File Browser tab and navigate there
+            self._view.page().runJavaScript(
+                f"window.__projspecShowTab && window.__projspecShowTab('filebrowser');"
+            )
+            self._fb_browse(url, push_history=False)
         elif tool == "pycharm":
             _spawn_detached(["pycharm", local, "nosplash", "dontReopenProjects"])
         elif tool == "jupyter":
@@ -396,6 +485,191 @@ class ProjspecWindow(QMainWindow):
             target = pick
         _open_with_default(os.path.dirname(target) or target)
 
+    # ── File browser actions (all in-process via filebrowser.py) ────────────
+
+    def _fb_browse(
+        self, url: str, storage_options=None, push_history: bool = True
+    ) -> None:
+        from projspec.filebrowser import browse
+
+        so = _parse_so(storage_options)
+        data = browse(url, storage_options=so)
+        self._fb_bridge.send(
+            {
+                "type": "browseResult",
+                "pushHistory": push_history,
+                "storageOptions": json.dumps(so) if so else "",
+                **data,
+            }
+        )
+
+    def _fb_inspect(self, url: str, storage_options=None) -> None:
+        from projspec.filebrowser import inspect_as_project
+
+        so = _parse_so(storage_options)
+        data = inspect_as_project(url, storage_options=so)
+        self._fb_bridge.send({"type": "inspectResult", **data})
+        self._fb_bridge.send(
+            {
+                "type": "projectScanned",
+                "url": url,
+                "project": data.get("project"),
+                "error": data.get("error"),
+                "text_preview": data.get("text_preview"),
+                "info": self._info_data,
+                "enums": self._enum_members,
+            }
+        )
+
+    def _fb_scan_dir(self, url: str, storage_options=None) -> None:
+        from projspec.filebrowser import scan_directory
+
+        so = _parse_so(storage_options)
+        data = scan_directory(url, storage_options=so)
+        self._fb_bridge.send(
+            {
+                "type": "projectScanned",
+                "info": self._info_data,
+                "enums": self._enum_members,
+                **data,
+            }
+        )
+
+    def _fb_expand_dir(self, url: str, storage_options=None) -> None:
+        from projspec.filebrowser import browse
+
+        so = _parse_so(storage_options)
+        data = browse(url, storage_options=so)
+        self._fb_bridge.send({"type": "expandResult", "parentUrl": url, **data})
+
+    def _fb_open_file(self, url: str, storage_options=None) -> None:
+        """Open a remote file: fetch content, write to temp file, open in default app."""
+        import os, tempfile
+
+        local = _url_to_local(url)
+        if os.path.exists(local):
+            _open_with_default(local)
+            return
+        from projspec.filebrowser import read_file
+
+        so = _parse_so(storage_options)
+        result = read_file(url, storage_options=so)
+        if result.get("error"):
+            QMessageBox.warning(self, "Open file", result["error"])
+            return
+        ext = os.path.splitext(url)[1] or ".txt"
+        tmp = tempfile.NamedTemporaryFile(
+            "w", suffix=ext, delete=False, encoding="utf-8"
+        )
+        tmp.write(result.get("content", ""))
+        tmp.close()
+        _open_with_default(tmp.name)
+
+    def _fb_write_file(self, url: str, content: str, storage_options=None) -> None:
+        from projspec.filebrowser import write_file
+
+        so = _parse_so(storage_options)
+        result = write_file(url, content, storage_options=so)
+        if result.get("error"):
+            QMessageBox.warning(self, "Write file", result["error"])
+            return
+        parent = url.rstrip("/").rsplit("/", 1)[0] or "/"
+        self._fb_browse(parent, storage_options, push_history=False)
+
+    def _fb_create_file(self, parent_url: str, name: str, storage_options=None) -> None:
+        from projspec.filebrowser import write_file
+
+        so = _parse_so(storage_options)
+        new_url = parent_url.rstrip("/") + "/" + name
+        result = write_file(new_url, "", storage_options=so)
+        if result.get("error"):
+            QMessageBox.warning(self, "Create file", result["error"])
+            return
+        self._fb_browse(parent_url, storage_options, push_history=False)
+
+    def _fb_delete_entry(self, url: str, is_dir: bool, storage_options=None) -> None:
+        from projspec.filebrowser import delete
+
+        label = url.rstrip("/").rsplit("/", 1)[-1] or url
+        reply = QMessageBox.question(
+            self,
+            "Delete",
+            f'Delete "{label}"?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        so = _parse_so(storage_options)
+        result = delete(url, storage_options=so, recursive=is_dir)
+        if result.get("error"):
+            QMessageBox.warning(self, "Delete", result["error"])
+            return
+        parent = url.rstrip("/").rsplit("/", 1)[0] or "/"
+        self._fb_browse(parent, storage_options, push_history=False)
+
+    def _fb_rename_entry(self, url: str, new_name: str, storage_options=None) -> None:
+        from projspec.filebrowser import move
+
+        so = _parse_so(storage_options)
+        parent = url.rstrip("/").rsplit("/", 1)[0] or "/"
+        dst = parent.rstrip("/") + "/" + new_name
+        result = move(url, dst, storage_options=so)
+        if result.get("error"):
+            QMessageBox.warning(self, "Rename", result["error"])
+            return
+        self._fb_browse(parent, storage_options, push_history=False)
+
+    def _fb_mkdir(self, parent_url: str, name: str, storage_options=None) -> None:
+        from projspec.filebrowser import mkdir
+
+        so = _parse_so(storage_options)
+        new_url = parent_url.rstrip("/") + "/" + name
+        result = mkdir(new_url, storage_options=so)
+        if result.get("error"):
+            QMessageBox.warning(self, "New folder", result["error"])
+            return
+        self._fb_browse(parent_url, storage_options, push_history=False)
+
+    def _fb_bookmark_add(self, url: str, label=None, storage_options=None) -> None:
+        from projspec.filebrowser import bookmark_add
+
+        so = _parse_so(storage_options)
+        bms = bookmark_add(url, label=label or "", storage_options=so)
+        self._fb_bridge.send({"type": "bookmarksUpdated", "bookmarks": bms})
+
+    def _fb_bookmark_remove(self, url: str) -> None:
+        from projspec.filebrowser import bookmark_remove
+
+        bms = bookmark_remove(url)
+        self._fb_bridge.send({"type": "bookmarksUpdated", "bookmarks": bms})
+
+    def _fb_add_to_library(self, url: str, storage_options=None) -> None:
+        from projspec.filebrowser import add_to_projspec_library
+
+        self._set_fb_busy(True)
+        try:
+            so = _parse_so(storage_options)
+            result = add_to_projspec_library(url, storage_options=so)
+            if result.get("error"):
+                QMessageBox.warning(self, "Add to library", result["error"])
+                return
+            # Refresh library URL badges in the filebrowser
+            self._fb_bridge.send(
+                {
+                    "type": "libraryUrlsUpdated",
+                    "libraryUrls": list(library.entries.keys()),
+                }
+            )
+            # Reload library tab and select the new entry
+            self._reload(select_url=url)
+            # Switch to library tab
+            self._view.page().runJavaScript(
+                "window.__projspecShowTab && window.__projspecShowTab('library');"
+            )
+        finally:
+            self._set_fb_busy(False)
+
     # ── Scan helper ─────────────────────────────────────────────────────────
 
     def _rescan(self, url: str) -> None:
@@ -455,6 +729,20 @@ class ProjspecWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _parse_so(storage_options) -> dict | None:
+    """Parse a storage_options value that may be a JSON string, dict, or None."""
+    if not storage_options:
+        return None
+    if isinstance(storage_options, dict):
+        return storage_options or None
+    if isinstance(storage_options, str):
+        try:
+            return json.loads(storage_options) or None
+        except Exception:
+            return None
+    return None
 
 
 def _url_to_local(url: str) -> str:

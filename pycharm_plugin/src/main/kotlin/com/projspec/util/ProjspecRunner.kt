@@ -89,11 +89,99 @@ object ProjspecRunner {
             walk(pu.Enum)
             print(json.dumps(out))
             """.trimIndent()
-        return try {
-            val cmd = GeneralCommandLine(listOf("python3", "-c", script))
-            val output = CapturingProcessHandler(cmd).runProcess(30_000)
-            if (output.isTimeout || output.exitCode != 0) "{}" else output.stdout.trim().ifBlank { "{}" }
-        } catch (_: Exception) { "{}" }
+        return when (val r = run(listOf("python", "-c", script))) {
+            is CliResult.Success -> r.stdout.trim().ifBlank { "{}" }
+            is CliResult.Failure -> "{}"
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Filebrowser CLI wrappers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Generic filebrowser subcommand call.  Returns the raw stdout string
+     * (JSON) or an empty JSON object on failure.
+     */
+    fun runFbCall(vararg args: String): String {
+        val fullArgs = listOf(cli) + args.toList()
+        return when (val r = run(fullArgs)) {
+            is CliResult.Success -> extractJson(r.stdout).ifBlank { "{}" }
+            is CliResult.Failure -> "{}"
+        }
+    }
+
+    /** `projspec filebrowser inspect-as-project <url>` — file metadata + project-shaped dict. */
+    fun runFbInspectAsProject(url: String, storageOptions: String?): String {
+        val args = mutableListOf(cli, "filebrowser", "inspect-as-project", url)
+        if (!storageOptions.isNullOrBlank()) { args.add("--storage-options"); args.add(storageOptions) }
+        return when (val r = run(args)) {
+            is CliResult.Success -> extractJson(r.stdout).ifBlank { "{}" }
+            is CliResult.Failure -> """{"url":"$url","project":null,"error":"${r.message.replace("\"","'")}"}"""
+        }
+    }
+
+    /** `projspec filebrowser browse <url> [--storage-options JSON]` */
+    fun runFbBrowse(url: String, storageOptions: String?): String {
+        val args = mutableListOf(cli, "filebrowser", "browse", url)
+        if (!storageOptions.isNullOrBlank()) { args.add("--storage-options"); args.add(storageOptions) }
+        return when (val r = run(args)) {
+            is CliResult.Success -> extractJson(r.stdout).ifBlank { "{}" }
+            is CliResult.Failure -> """{"url":"$url","entries":[],"error":"${r.message.replace("\"","'")}"}"""
+        }
+    }
+
+    /** `projspec filebrowser write-file <url>` (content via stdin/tmp file) */
+    fun runFbWriteFile(url: String, content: String, storageOptions: String?) {
+        // Write content to a temp file then pass via --content-file
+        val tmp = java.io.File.createTempFile("projspec_fb_", ".txt")
+        try {
+            tmp.writeText(content, Charsets.UTF_8)
+            val args = mutableListOf(cli, "filebrowser", "write-file", url,
+                "--content-file", tmp.absolutePath)
+            if (!storageOptions.isNullOrBlank()) { args.add("--storage-options"); args.add(storageOptions) }
+            run(args)
+        } finally { tmp.delete() }
+    }
+
+    /** `projspec filebrowser delete <url> [--recursive] [--storage-options JSON]` */
+    fun runFbDelete(url: String, recursive: Boolean, storageOptions: String?) {
+        val args = mutableListOf(cli, "filebrowser", "delete", url)
+        if (recursive) args.add("--recursive")
+        if (!storageOptions.isNullOrBlank()) { args.add("--storage-options"); args.add(storageOptions) }
+        run(args)
+    }
+
+    /** `projspec filebrowser move <src> <dst> [--storage-options JSON]` */
+    fun runFbMove(src: String, dst: String, storageOptions: String?) {
+        val args = mutableListOf(cli, "filebrowser", "move", src, dst)
+        if (!storageOptions.isNullOrBlank()) { args.add("--storage-options"); args.add(storageOptions) }
+        run(args)
+    }
+
+    /** `projspec filebrowser mkdir <url> [--storage-options JSON]` */
+    fun runFbMkdir(url: String, storageOptions: String?) {
+        val args = mutableListOf(cli, "filebrowser", "mkdir", url)
+        if (!storageOptions.isNullOrBlank()) { args.add("--storage-options"); args.add(storageOptions) }
+        run(args)
+    }
+
+    /** `projspec filebrowser bookmarks add <url> [--label LABEL]` → JSON bookmarks list */
+    fun runFbBookmarkAdd(url: String, label: String?, storageOptions: String?): String {
+        val args = mutableListOf(cli, "filebrowser", "bookmarks", "add", url)
+        if (!label.isNullOrBlank()) { args.add("--label"); args.add(label) }
+        return when (val r = run(args)) {
+            is CliResult.Success -> extractJson(r.stdout).ifBlank { "[]" }
+            is CliResult.Failure -> "[]"
+        }
+    }
+
+    /** `projspec filebrowser bookmarks remove <url>` → JSON bookmarks list */
+    fun runFbBookmarkRemove(url: String): String {
+        return when (val r = run(listOf(cli, "filebrowser", "bookmarks", "remove", url))) {
+            is CliResult.Success -> extractJson(r.stdout).ifBlank { "[]" }
+            is CliResult.Failure -> "[]"
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -103,28 +191,48 @@ object ProjspecRunner {
     /**
      * Execute an external command and capture stdout/stderr.
      *
+     * Runs via the login shell (`$SHELL -l -c`) so the user's PATH
+     * (conda envs, pyenv, Homebrew, etc.) is available exactly as it
+     * would be in a terminal — even when launched from a macOS GUI app.
+     *
+     * Every call is logged with args, duration, and result.
+     *
      * NOTE: blocks the calling thread for up to 60 s.  Never call from the EDT.
      */
     fun run(args: List<String>): CliResult {
+        // Shell-quote each argument so spaces and special chars survive
+        fun quote(s: String) = "'" + s.replace("'", "'\\''") + "'"
+        val shellCmd = args.joinToString(" ") { quote(it) }
+        val shell = System.getenv("SHELL")?.takeIf { it.isNotBlank() } ?: "/bin/sh"
+        val fullArgs = listOf(shell, "-l", "-c", shellCmd)
+
+        PluginLogger.info("CLI call: $shellCmd")
+        val t0 = System.currentTimeMillis()
         return try {
-            val commandLine = GeneralCommandLine(args)
+            val commandLine = GeneralCommandLine(fullArgs)
             val handler = CapturingProcessHandler(commandLine)
             val output = handler.runProcess(60_000)
+            val ms = System.currentTimeMillis() - t0
 
             when {
-                output.isTimeout ->
+                output.isTimeout -> {
+                    PluginLogger.error("CLI timeout after 60 s: $shellCmd")
                     CliResult.Failure("projspec timed out after 60 s", -1)
-                output.exitCode != 0 ->
-                    CliResult.Failure(
-                        output.stderr.ifBlank { output.stdout }
-                            .ifBlank { "Exit code ${output.exitCode}" },
-                        output.exitCode,
-                    )
-                else ->
+                }
+                output.exitCode != 0 -> {
+                    val err = output.stderr.ifBlank { output.stdout }.ifBlank { "Exit code ${output.exitCode}" }
+                    PluginLogger.warn("CLI exit ${output.exitCode} (${ms}ms): $shellCmd\n  stderr: ${output.stderr.trim().take(500)}\n  stdout: ${output.stdout.trim().take(500)}")
+                    CliResult.Failure(err, output.exitCode)
+                }
+                else -> {
+                    PluginLogger.info("CLI ok (${ms}ms): $shellCmd  stdout(${output.stdout.length}b)")
                     CliResult.Success(output.stdout)
+                }
             }
         } catch (e: Exception) {
-            CliResult.Failure("Failed to launch projspec: ${e.message}")
+            val ms = System.currentTimeMillis() - t0
+            PluginLogger.error("CLI exception (${ms}ms): $shellCmd\n  ${e.javaClass.simpleName}: ${e.message}")
+            CliResult.Failure("Failed to launch: ${e.message}")
         }
     }
 
