@@ -45,15 +45,15 @@ if TYPE_CHECKING:  # pragma: no cover
 
 _ESM_TEMPLATE = r"""
 const PANEL_HTML_BODY = __PANEL_HTML_BODY__;
-const FB_HTML_BODY    = __FB_HTML_BODY__;
-const PANEL_CSS  = __PANEL_CSS__;
-const PANEL_JS   = __PANEL_JS__;
-const FB_CSS     = __FB_CSS__;
-const FB_JS      = __FB_JS__;
-const TABS_CSS   = __TABS_CSS__;
-const TABS_JS    = __TABS_JS__;
+const FB_HTML_BODY = __FB_HTML_BODY__;
+const PANEL_CSS = __PANEL_CSS__;
+const PANEL_JS = __PANEL_JS__;
+const FB_CSS = __FB_CSS__;
+const FB_JS = __FB_JS__;
+const TABS_CSS = __TABS_CSS__;
+const TABS_JS = __TABS_JS__;
 const CHROME_ICONS = __CHROME_ICONS__;
-const INITIAL_TAB  = __INITIAL_TAB__;
+const INITIAL_TAB = __INITIAL_TAB__;
 
 // CSS variable fallbacks so --vscode-* tokens resolve in notebook environments
 // that don't provide them (JupyterLab, Colab, VS Code notebooks, marimo).
@@ -890,6 +890,8 @@ def _open_with(tool: str, url: str, toast) -> None:
     local = _url_to_local(url)
     if tool == "vscode":
         _spawn_detached(["code", local], toast)
+    elif tool == "filebrowser":
+        _open_with_default(local, toast)
     elif tool == "pycharm":
         _spawn_detached(["pycharm", local, "nosplash", "dontReopenProjects"], toast)
     elif tool == "jupyter":
