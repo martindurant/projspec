@@ -1,0 +1,125 @@
+<div id="fb-app">
+
+  <!-- Left: directory tree pane -->
+  <div id="fb-tree-pane">
+    <div id="fb-toolbar">
+      <button id="btn-back"         class="fb-icon-btn" title="Back">&#9668;</button>
+      <button id="btn-up"           class="fb-icon-btn" title="Up one level">&#8679;</button>
+      <button id="btn-refresh"      class="fb-icon-btn" title="Refresh">&#8635;</button>
+      <button id="btn-bm-dropdown"  class="fb-icon-btn" title="Bookmarks">&#9733;</button>
+      <button id="btn-so"           class="fb-icon-btn" title="Storage options">&#128273;</button>
+      <div class="fb-spacer"></div>
+      <button id="btn-new-file"     class="fb-icon-btn" title="New file">+F</button>
+      <button id="btn-new-dir"      class="fb-icon-btn" title="New folder">+D</button>
+    </div>
+
+    <div id="fb-url-bar">
+      <input id="fb-url-input" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Enter URL or path" />
+      <button id="btn-go" class="fb-go-btn">Go</button>
+    </div>
+
+    <div id="fb-breadcrumb"></div>
+
+    <div id="fb-file-list">
+      <div id="fb-col-headers">
+        <span class="fb-col-name fb-col-hdr" data-col="name">Name <span class="fb-sort-arrow"></span></span>
+        <span class="fb-col-size fb-col-hdr" data-col="size">Size <span class="fb-sort-arrow"></span></span>
+        <span class="fb-col-mtime fb-col-hdr" data-col="mtime">Modified <span class="fb-sort-arrow"></span></span>
+      </div>
+      <div id="fb-empty"   class="fb-status hidden">Directory is empty.</div>
+      <div id="fb-error"   class="fb-status fb-error hidden"></div>
+      <div id="fb-entries"></div>
+    </div>
+
+    <div id="fb-debug" style="padding:4px 8px;font-size:10px;font-family:monospace;color:var(--vscode-descriptionForeground,#858585);border-top:1px solid var(--vscode-panel-border,#3c3c3c);max-height:80px;overflow-y:auto;display:none;"></div>
+
+    <div id="fb-spinner" class="fb-spinner hidden">
+      <span class="spin">&#9203;</span> Loading&#8230;
+    </div>
+  </div>
+
+  <!-- Right: info / preview pane -->
+  <div id="fb-info-pane">
+    <div id="fb-info-header">
+      <div id="fb-info-title">No file selected</div>
+      <div id="fb-info-actions" class="hidden">
+        <button id="btn-open-editor" class="primary"  title="Open in editor">Open</button>
+        <button id="btn-add-to-lib"                   title="Add to projspec library">+ Library</button>
+        <button id="btn-bookmark"                     title="Bookmark this location">Bookmark</button>
+        <button id="btn-delete-sel"  class="danger"   title="Delete">Delete</button>
+        <button id="btn-rename-sel"                   title="Rename">Rename</button>
+      </div>
+    </div>
+    <div id="fb-info-top">
+      <div id="fb-info-meta"></div>
+      <div id="fb-info-preview"></div>
+    </div>
+    <div id="fb-scan-pane" class="hidden">
+      <!-- Embedded project panel for directory scan results -->
+      <div id="fb-scan-panel-root"><!--FB_SCAN_PANEL_BODY--></div>
+      <!-- Inline file content display (no project widget) -->
+      <div id="fb-file-content" class="hidden"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Bookmarks dropdown -->
+<div id="bm-panel" class="hidden">
+  <div class="bm-header">
+    Bookmarks
+    <button id="bm-close" class="fb-icon-btn">&#10005;</button>
+  </div>
+  <div id="bm-list"></div>
+  <div class="bm-footer">
+    <button id="btn-bm-add-current">+ Bookmark current location</button>
+  </div>
+</div>
+
+<!-- Storage-options modal -->
+<div id="so-overlay" class="overlay hidden">
+  <div class="fb-modal" role="dialog">
+    <div class="fb-modal-title">Storage Options</div>
+    <div class="fb-modal-body">
+      <p class="hint">JSON dictionary of fsspec storage options (credentials, endpoints, etc.).</p>
+      <label for="so-input">Storage options (JSON):</label>
+      <textarea id="so-input" rows="5" spellcheck="false"
+                placeholder='{"key": "...", "secret": "..."}'></textarea>
+    </div>
+    <div class="fb-modal-footer">
+      <button id="so-cancel" class="secondary">Cancel</button>
+      <button id="so-ok" class="primary">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- New file/dir modal -->
+<div id="newentry-overlay" class="overlay hidden">
+  <div class="fb-modal" role="dialog">
+    <div class="fb-modal-title" id="newentry-title">New file</div>
+    <div class="fb-modal-body">
+      <label for="newentry-name">Name:</label>
+      <input type="text" id="newentry-name" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="fb-modal-footer">
+      <button id="newentry-cancel" class="secondary">Cancel</button>
+      <button id="newentry-ok" class="primary">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Rename modal -->
+<div id="rename-overlay" class="overlay hidden">
+  <div class="fb-modal" role="dialog">
+    <div class="fb-modal-title">Rename</div>
+    <div class="fb-modal-body">
+      <label for="rename-input">New name:</label>
+      <input type="text" id="rename-input" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="fb-modal-footer">
+      <button id="rename-cancel" class="secondary">Cancel</button>
+      <button id="rename-ok" class="primary">Rename</button>
+    </div>
+  </div>
+</div>

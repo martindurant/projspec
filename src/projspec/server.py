@@ -43,6 +43,7 @@ POST /filebrowser/bookmarks/remove → {"url": str}
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -77,8 +78,6 @@ def _log_path() -> Path:
 
 def _setup_logging() -> logging.Logger:
     logger = logging.getLogger("projspec.server")
-    if logger.handlers:
-        return logger
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
