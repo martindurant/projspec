@@ -23,25 +23,28 @@ object HtmlContent {
     @Volatile private var _cachedHtml: String? = null
 
     private fun buildHtmlFresh(): String {
-        // Build the bootstrap strings in Kotlin and pass them as argv[1..3]
+        // Build the bootstrap strings in Kotlin and pass them as argv[1..4]
         // so the Python script stays trivially simple and escaping-safe.
         val extraHead = "<style>$THEME_FALLBACKS_CSS</style>"
-        val libBootstrap = LIB_BRIDGE_BOOTSTRAP
-        val fbBootstrap  = FB_BRIDGE_BOOTSTRAP
+        val libBootstrap      = LIB_BRIDGE_BOOTSTRAP
+        val fbBootstrap       = FB_BRIDGE_BOOTSTRAP
+        val scanPanelBootstrap = SCAN_PANEL_BOOTSTRAP
 
         // Minimal Python script — just imports and prints.  All variable
         // content comes in through sys.argv to avoid any quoting issues.
         val script = """
 import sys, json
-extra_head    = sys.argv[1]
-lib_bootstrap = sys.argv[2]
-fb_bootstrap  = sys.argv[3]
+extra_head          = sys.argv[1]
+lib_bootstrap       = sys.argv[2]
+fb_bootstrap        = sys.argv[3]
+scan_panel_bootstrap = sys.argv[4]
 try:
     from projspec.webui import get_combined_html
     html = get_combined_html(
         extra_head=extra_head,
         lib_bootstrap_js=lib_bootstrap,
         fb_bootstrap_js=fb_bootstrap,
+        scan_panel_bootstrap_js=scan_panel_bootstrap,
     )
     sys.stdout.buffer.write(html.encode('utf-8'))
 except Exception as e:
@@ -53,7 +56,7 @@ except Exception as e:
 
         return try {
             val cmd = GeneralCommandLine(
-                listOf("python3", "-c", script, extraHead, libBootstrap, fbBootstrap)
+                listOf("python3", "-c", script, extraHead, libBootstrap, fbBootstrap, scanPanelBootstrap)
             )
             cmd.charset = Charsets.UTF_8
             val output = CapturingProcessHandler(cmd).runProcess(30_000)
@@ -146,6 +149,45 @@ and on <code>PATH</code>, then restart the IDE.</p>
             if (dispatch) dispatch(msg); else inbox.push(msg);
         };
         while (pending.length) bridge.query(JSON.stringify(pending.shift()));
+    };
+})();
+</script>"""
+
+    /**
+     * Bootstrap for the embedded scan sub-panel inside the file browser.
+     * Runs before the second panel.js invocation (which powers the directory
+     * scan widget inside #fb-scan-panel-root).  Sets up:
+     *   - window.projspecRoot   → the #fb-scan-panel-root element
+     *   - window.projspecTransport  → no-op send; onReady captures the dispatch fn
+     *   - window.__fbPanelDeliver   → called by filebrowser.js to push data in
+     *
+     * The sub-panel only displays data; it never sends commands back.
+     */
+    val SCAN_PANEL_BOOTSTRAP = """<script>
+(function() {
+    var root = document.getElementById('fb-scan-panel-root');
+    if (!root) return;
+    var pending = [];
+    window.__fbPanelDeliver = function(msg) {
+        if (window.__fbPanelDispatch) { window.__fbPanelDispatch(msg); }
+        else { pending.push(msg); }
+    };
+    // Save the library panel's dispatch before the second panel.js run
+    // overwrites window.__projspecDeliver.  We restore it in onReady().
+    var savedLibDeliver = window.__projspecDeliver;
+    window.projspecRoot = root;
+    window.projspecTransport = {
+        send: function() {},  // scan sub-panel never sends commands
+        onReady: function(d) {
+            // panel.js already wrote window.__projspecDeliver = d above;
+            // restore the library panel's dispatch so postData() still works.
+            window.__projspecDeliver = savedLibDeliver;
+            window.__fbPanelDispatch = d;
+            pending.forEach(function(m) { d(m); });
+            pending = [];
+            delete window.projspecRoot;
+            delete window.projspecTransport;
+        },
     };
 })();
 </script>"""

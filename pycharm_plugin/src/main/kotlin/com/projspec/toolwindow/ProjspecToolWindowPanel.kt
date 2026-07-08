@@ -773,14 +773,19 @@ class ProjspecToolWindowPanel(
         val so = server.parseSo(storageOptions)
         val data: Map<String, Any?> = server.scanDirectory(url, so)
             ?: run {
-                // CLI fallback: projspec scan --json-out
-                val res = ProjspecRunner.runScan(url, storageOptions)
-                val rawJson = if (res is CliResult.Success) ProjspecRunner.extractJson(res.stdout) else ""
-                val proj = if (rawJson.isNotBlank()) {
-                    try { gson.fromJson(rawJson, Map::class.java) } catch (_: Exception) { null }
-                } else null
-                mapOf("url" to url, "project" to proj,
-                      "error" to if (rawJson.isBlank()) (res as? CliResult.Failure)?.message else null)
+                // CLI fallback: calls projspec.filebrowser.scan_directory directly via
+                // a short Python script so the result is always a {url, project, error}
+                // dict — even for directories with no matching spec types.
+                val rawJson = ProjspecRunner.runScanDirectory(url, storageOptions)
+                try {
+                    @Suppress("UNCHECKED_CAST")
+                    if (rawJson.isNotBlank() && rawJson != "{}")
+                        gson.fromJson(rawJson, Map::class.java) as Map<String, Any?>
+                    else
+                        mapOf("url" to url, "project" to null, "error" to "CLI scan produced no output")
+                } catch (_: Exception) {
+                    mapOf("url" to url, "project" to null, "error" to "Could not parse CLI scan output")
+                }
             }
         deliverToFbWebview(mapOf(
             "type"  to "projectScanned",

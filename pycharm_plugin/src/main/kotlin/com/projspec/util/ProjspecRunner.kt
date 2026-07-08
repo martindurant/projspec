@@ -39,14 +39,41 @@ object ProjspecRunner {
      * (a JSON string) so remote projects (s3://, gcs://, …) can be re-scanned
      * with their filesystem credentials/flags intact.
      */
-    fun runScan(path: String, storageOptions: String? = null): CliResult {
-        val args = mutableListOf(cli, "scan", "--library")
-        if (!storageOptions.isNullOrBlank()) {
-            args.add("--storage_options")
-            args.add(storageOptions)
+     fun runScan(path: String, storageOptions: String? = null): CliResult {
+         val args = mutableListOf(cli, "scan", "--library")
+         if (!storageOptions.isNullOrBlank()) {
+             args.add("--storage_options")
+             args.add(storageOptions)
+         }
+         args.add(path)
+         return run(args)
+     }
+
+    /**
+     * CLI fallback for the file-browser's directory scan panel.
+     * Calls `projspec.filebrowser.scan_directory` via a short Python script so
+     * the result always has the `{url, project, error}` shape that
+     * `showProjectInPanel` expects, even for directories that contain no
+     * recognised projspec spec types (where `projspec scan --json-out` would
+     * produce no output).
+     */
+    fun runScanDirectory(url: String, storageOptions: String? = null): String {
+        val soArg = storageOptions?.takeIf { it.isNotBlank() } ?: "null"
+        val script = """
+import json, sys
+url = sys.argv[1]
+so = json.loads(sys.argv[2]) if sys.argv[2] != 'null' else None
+try:
+    from projspec.filebrowser import scan_directory
+    result = scan_directory(url, storage_options=so)
+except Exception as e:
+    result = {'url': url, 'project': None, 'error': str(e)}
+print(json.dumps(result))
+""".trimIndent()
+        return when (val r = run(listOf("python", "-c", script, url, soArg))) {
+            is CliResult.Success -> extractJson(r.stdout).ifBlank { "{}" }
+            is CliResult.Failure -> "{}"
         }
-        args.add(path)
-        return run(args)
     }
 
     /** `projspec create <spec> <path>` — create a new spec inside a project. */
