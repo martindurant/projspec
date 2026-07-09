@@ -175,7 +175,7 @@
                 : 'No projects match the filter.';
             projectsEl.appendChild(e);
         }
-        if (selection) renderDetails();
+        renderDetails();
     }
 
     function renderProject(url, project) {
@@ -283,7 +283,7 @@
         const isLocal = url.startsWith('file://');
         if (isLocal) {
             addItem(menu, 'Open with VSCode', () => postMessage({ cmd: 'openWith', tool: 'vscode', url }));
-            addItem(menu, 'Open with system filebrowser', () => postMessage({ cmd: 'openWith', tool: 'filebrowser', url }));
+            addItem(menu, 'Show in file browser', () => postMessage({ cmd: 'openWith', tool: 'filebrowser', url }));
             addItem(menu, 'Open with PyCharm', () => postMessage({ cmd: 'openWith', tool: 'pycharm', url }));
             addItem(menu, 'Open with jupyter', () => postMessage({ cmd: 'openWith', tool: 'jupyter', url }));
             addSeparator(menu);

@@ -21,7 +21,18 @@
     "commands": [
       {
         "command": "projspec.showTree",
-        "title": "Project Library"
+        "title": "Open projspec Panel",
+        "category": "projspec"
+      },
+      {
+        "command": "projspec.openFileBrowser",
+        "title": "Open File Browser",
+        "category": "projspec"
+      },
+      {
+        "command": "projspec.openFileBrowserHere",
+        "title": "Open File Browser at Current Folder",
+        "category": "projspec"
       }
     ],
     "viewsContainers": {

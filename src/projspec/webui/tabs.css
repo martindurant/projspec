@@ -1,0 +1,76 @@
+/* Tab bar layout for the combined projspec panel.
+ *
+ * Shared by all GUI hosts (Qt, ipywidget, PyCharm, VSCode).
+ * Include this stylesheet alongside panel.css and filebrowser.css.
+ */
+
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+
+/* ── Tab bar ─────────────────────────────────────────────────────────────── */
+#tab-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid var(--vscode-panel-border, #3c3c3c);
+    background: var(--vscode-editorGroupHeader-tabsBackground,
+                    var(--vscode-editor-background, #1e1e1e));
+    flex-shrink: 0;
+}
+.tab-btn {
+    background: transparent;
+    color: var(--vscode-foreground, #cccccc);
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    padding: 7px 18px;
+    font-size: 13px;
+    font-family: var(--vscode-font-family, sans-serif);
+    cursor: pointer;
+    outline: none;
+    white-space: nowrap;
+}
+.tab-btn:hover { background: var(--vscode-list-hoverBackground, #2a2d2e); }
+.tab-btn.active {
+    border-bottom-color: var(--vscode-focusBorder,
+                              var(--vscode-button-background, #007acc));
+    font-weight: 600;
+}
+
+/* ── Tab panes ───────────────────────────────────────────────────────────── */
+.tab-pane {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 36px);
+    overflow: hidden;
+}
+.tab-pane.hidden { display: none !important; }
+
+/* The library panel's #app fills the full pane height */
+#tab-library #app     { height: 100%; overflow: hidden; }
+
+/* The filebrowser #fb-app fills the full pane height */
+#tab-filebrowser #fb-app { height: 100%; }
+
+/* Embedded scan panel inside the filebrowser info pane */
+#fb-scan-panel-root #app {
+    flex-direction: column;
+    height: 100%;
+    overflow: hidden;
+}
+#fb-scan-panel-root #library {
+    width: 100% !important;
+    max-width: 100% !important;
+    border-right: none !important;
+    flex: 0 0 auto;
+    max-height: 50%;
+    overflow: hidden;
+}
+#fb-scan-panel-root .toolbar,
+#fb-scan-panel-root .search,
+#fb-scan-panel-root #spinner { display: none !important; }
+#fb-scan-panel-root #projects { flex: 1; overflow-y: auto; padding: 4px; }
+#fb-scan-panel-root #details {
+    flex: 1;
+    border-top: 1px solid var(--vscode-panel-border, #3c3c3c);
+    overflow: hidden;
+    min-height: 0;
+}

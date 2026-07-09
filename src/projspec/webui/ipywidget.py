@@ -1,4 +1,4 @@
-"""Jupyter / marimo widget representation of :class:`ProjectLibrary`.
+"""Jupyter / marimo combined widget: Project Library + File Browser tabs.
 
 This module owns the *host* side of the shared webui transport for the
 Jupyter Notebook / JupyterLab / VSCode-notebook / Colab / marimo
@@ -7,21 +7,17 @@ shared HTML, CSS and JS from :mod:`projspec.webui` and drives it from
 Python with the same command vocabulary as the VSCode extension and the
 Qt app.
 
-Only :mod:`anywidget` is required — :mod:`ipywidgets` is **not** needed,
-which means the widget runs under marimo as well as classic Jupyter.
+Only :mod:`anywidget` is required — :mod:`ipywidgets` is **not** needed.
 
-Current limitations
--------------------
+The widget now hosts two tabs:
 
-The shared JS uses ``document.getElementById`` with global IDs (``#app``,
-``#projects``, etc.), which is fine for a single widget per notebook but
-means two widgets on the same page would fight for those IDs.  This
-matches the existing VSCode/Qt/PyCharm design; scoping is a follow-up.
+* **Project Library** — the searchable library list + details panel.
+* **File Browser** — an fsspec-backed directory browser with bookmarks,
+  file info, dataset summaries, and "Add to Library" integration.
 
-The widget is interactive: the toolbar's *Add / Reload / Configure*
-buttons, the kebab menu (Rescan / Create spec / Remove from library /
-Open with …), and the per-artifact ``Make`` button all round-trip to the
-Python kernel and modify the underlying :class:`ProjectLibrary`.
+Filebrowser commands are tagged with ``_fb: True`` in the message envelope
+so the single ``msg:custom`` channel can route them to the correct Python
+handler without ambiguity.
 """
 
 from __future__ import annotations
@@ -29,150 +25,214 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
-from projspec.webui import chrome_icons, get_panel_css, get_panel_js
+from projspec.webui import (
+    chrome_icons,
+    get_filebrowser_css,
+    get_filebrowser_js,
+    get_panel_css,
+    get_panel_js,
+    get_tabs_css,
+    get_tabs_js,
+)
 
-if TYPE_CHECKING:  # pragma: no cover - type-only import
+if TYPE_CHECKING:  # pragma: no cover
     from projspec.library import ProjectLibrary
 
 
 # ---------------------------------------------------------------------------
-#  ESM module text (anywidget _esm)
+#  ESM module text
 # ---------------------------------------------------------------------------
-#
-# anywidget loads ``_esm`` as a JavaScript module whose default export is
-# ``{render({model, el}) -> cleanup?}``.  We embed the shared panel HTML
-# into ``el``, install a transport that proxies to the widget's
-# ``model.send`` / ``model.on('msg:custom', ...)``, and then execute the
-# shared panel script.
-#
-# Each render re-installs the transport on ``window.projspecTransport`` and
-# re-runs the panel JS.  See module docstring for the single-instance
-# caveat this carries.
-#
-# The panel HTML must be inserted inline (not via an iframe) so the host
-# CSS variables propagate from the hosting notebook / JupyterLab theme.
-
-# NOTE: kept as a triple-quoted Python string.  The JS template-string
-# placeholders ${...} inside the code below are the *JavaScript* kind and
-# must stay literal - we use a non-f-string so Python does not touch them.
 
 _ESM_TEMPLATE = r"""
 const PANEL_HTML_BODY = __PANEL_HTML_BODY__;
+const FB_HTML_BODY = __FB_HTML_BODY__;
 const PANEL_CSS = __PANEL_CSS__;
 const PANEL_JS = __PANEL_JS__;
+const FB_CSS = __FB_CSS__;
+const FB_JS = __FB_JS__;
+const TABS_CSS = __TABS_CSS__;
+const TABS_JS = __TABS_JS__;
 const CHROME_ICONS = __CHROME_ICONS__;
+const INITIAL_TAB = __INITIAL_TAB__;
+
+// CSS variable fallbacks so --vscode-* tokens resolve in notebook environments
+// that don't provide them (JupyterLab, Colab, VS Code notebooks, marimo).
+// Values match the Darcula / VS Code dark palette used across all other hosts.
+const THEME_CSS = `
+:root {
+    --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --vscode-editor-font-family: "JetBrains Mono", Consolas, Menlo, monospace;
+    --vscode-foreground: #cccccc;
+    --vscode-editor-background: #1e1e1e;
+    --vscode-editorWidget-background: #252526;
+    --vscode-editorWidget-foreground: #cccccc;
+    --vscode-editorWidget-border: #454545;
+    --vscode-panel-border: #3c3c3c;
+    --vscode-focusBorder: #007acc;
+    --vscode-descriptionForeground: #858585;
+    --vscode-button-background: #0e639c;
+    --vscode-button-foreground: #ffffff;
+    --vscode-button-hoverBackground: #1177bb;
+    --vscode-button-secondaryBackground: #3a3d41;
+    --vscode-button-secondaryForeground: #cccccc;
+    --vscode-input-background: #3c3c3c;
+    --vscode-input-foreground: #cccccc;
+    --vscode-input-border: #3c3c3c;
+    --vscode-list-hoverBackground: #2a2d2e;
+    --vscode-list-activeSelectionBackground: #094771;
+    --vscode-list-activeSelectionForeground: #ffffff;
+    --vscode-menu-background: #252526;
+    --vscode-menu-foreground: #cccccc;
+    --vscode-menu-border: #454545;
+    --vscode-menu-selectionBackground: #094771;
+    --vscode-menu-selectionForeground: #ffffff;
+    --vscode-menu-separatorBackground: #454545;
+    --vscode-toolbar-hoverBackground: #2a2d2e;
+    --vscode-disabledForeground: #858585;
+    --vscode-textLink-foreground: #3794ff;
+    --vscode-textBlockQuote-background: rgba(255,255,255,0.06);
+    --vscode-symbolIcon-propertyForeground: #cccccc;
+    --vscode-symbolIcon-stringForeground: #ce9178;
+    --vscode-symbolIcon-numberForeground: #b5cea8;
+    --vscode-symbolIcon-keywordForeground: #569cd6;
+    --vscode-symbolIcon-enumeratorMemberForeground: #4ec9b0;
+    --vscode-editorInfo-foreground: #3794ff;
+    --vscode-editorInfo-border: #3794ff;
+    --vscode-editorWarning-foreground: #cca700;
+    --vscode-editorWarning-border: #cca700;
+    --vscode-errorForeground: #f48771;
+    --vscode-badge-background: #4d4d4d;
+    --vscode-badge-foreground: #ffffff;
+    --vscode-editorGroupHeader-tabsBackground: #252526;
+}
+`;
 
 export function render({ model, el }) {
-    // Per-widget root element.  We install it on ``window.projspecRoot``
-    // before evaluating the shared panel script; ``panel.js`` scopes every
-    // element lookup to that root so multiple widget instances (or stale
-    // nodes from an earlier render) don't fight over the same global IDs.
+    // ── Root container ──────────────────────────────────────────────────
     const root = document.createElement('div');
     root.className = 'projspec-root';
     root.style.width = '100%';
-    root.innerHTML = PANEL_HTML_BODY;
-    // Install the chrome-icons map and the scoped-root reference the panel
-    // script reads at startup.
+    root.style.height = '600px';
+
+    const styleEl = document.createElement('style');
+    styleEl.textContent = THEME_CSS + '\n' + TABS_CSS + '\n' + PANEL_CSS + '\n' + FB_CSS;
+    root.appendChild(styleEl);
+
+    // Build tab structure
+    const tabBar = document.createElement('div');
+    tabBar.id = 'tab-bar';
+    tabBar.innerHTML =
+        '<button class="tab-btn" id="tab-btn-library">Project Library</button>' +
+        '<button class="tab-btn" id="tab-btn-filebrowser">\uD83D\uDCC1 File Browser</button>';
+    root.appendChild(tabBar);
+
+    const libPane = document.createElement('div');
+    libPane.id = 'tab-library';
+    libPane.className = 'tab-pane hidden';
+    libPane.innerHTML = PANEL_HTML_BODY;
+    root.appendChild(libPane);
+
+    const fbPane = document.createElement('div');
+    fbPane.id = 'tab-filebrowser';
+    fbPane.className = 'tab-pane hidden';
+    fbPane.innerHTML = FB_HTML_BODY;
+    root.appendChild(fbPane);
+
     window.__PROJSPEC_CHROME_ICONS__ = CHROME_ICONS;
-    window.projspecRoot = root;
 
-    // Transport: JS -> kernel via model.send; kernel -> JS via
-    // msg:custom.  The panel script will call transport.onReady(dispatch)
-    // exactly once; we stash the dispatcher so late-arriving messages
-    // are delivered correctly.
-    let dispatcher = null;
-    const inbox = [];
-    function onHostMessage(msg) {
-        if (dispatcher) dispatcher(msg);
-        else inbox.push(msg);
+    // ── Library transport ──────────────────────────────────────────────
+    let libDispatch = null;
+    const libInbox = [];
+    function onLibMessage(raw) {
+        if (raw._fb) return;
+        if (libDispatch) libDispatch(raw); else libInbox.push(raw);
     }
-    model.on('msg:custom', onHostMessage);
-
+    model.on('msg:custom', onLibMessage);
+    window.projspecRoot = libPane;
     window.projspecTransport = {
         send: (msg) => model.send(msg),
-        onReady: (dispatch) => {
-            dispatcher = dispatch;
-            while (inbox.length) dispatcher(inbox.shift());
+        onReady: (d) => { libDispatch = d; while (libInbox.length) libDispatch(libInbox.shift()); },
+    };
+    try { new Function(PANEL_JS).call(window); } catch (e) { console.error('panel.js:', e); }
+
+    // ── Scan sub-panel transport ────────────────────────────────────────
+    const scanRoot = fbPane.querySelector('#fb-scan-panel-root');
+    let fbPanelDispatch = null;
+    const fbPanelInbox = [];
+    window.__fbPanelDeliver = function(msg) {
+        if (fbPanelDispatch) fbPanelDispatch(msg); else fbPanelInbox.push(msg);
+    };
+    window.projspecRoot = scanRoot;
+    window.projspecTransport = {
+        send: function() {},
+        onReady: function(d) {
+            fbPanelDispatch = d;
+            fbPanelInbox.forEach(m => d(m)); fbPanelInbox.length = 0;
+            delete window.projspecRoot; delete window.projspecTransport;
         },
     };
+    try { new Function(PANEL_JS).call(window); } catch (e) { console.error('scan panel.js:', e); }
 
-    // Scoped stylesheet (per-widget <style>) so repeated widget renders
-    // don't pile up.  The CSS uses :root-ish global rules on body/#app,
-    // but since those IDs are re-used per render and the widget is a
-    // single-instance tool, this is tolerable.
-    const styleEl = document.createElement('style');
-    styleEl.textContent = PANEL_CSS;
-    root.prepend(styleEl);
-    el.appendChild(root);
-
-    // Finally, evaluate the panel script in the window scope.  Using new
-    // Function + .call(window) gives it ``this === window`` and access
-    // to document.getElementById - same environment the VSCode/Qt hosts
-    // provide.
-    try {
-        new Function(PANEL_JS).call(window);
-    } catch (err) {
-        console.error('projspec panel script failed:', err);
-        const pre = document.createElement('pre');
-        pre.style.color = '#c66';
-        pre.textContent = String(err && err.stack || err);
-        el.appendChild(pre);
+    // ── Filebrowser transport ──────────────────────────────────────────
+    let fbDispatch = null;
+    const fbInbox = [];
+    function onFbMessage(raw) {
+        if (!raw._fb) return;
+        const msg = Object.assign({}, raw); delete msg._fb;
+        if (fbDispatch) fbDispatch(msg); else fbInbox.push(msg);
     }
+    model.on('msg:custom', onFbMessage);
+    window.projspecFbRoot = fbPane;
+    window.projspecFbTransport = {
+        send: (msg) => model.send(Object.assign({}, msg, {_fb: true})),
+        onReady: (d) => { fbDispatch = d; while (fbInbox.length) fbDispatch(fbInbox.shift()); },
+    };
+    try { new Function(FB_JS).call(window); } catch (e) { console.error('filebrowser.js:', e); }
+
+    // ── Tab coordination ───────────────────────────────────────────────
+    // Append root to el NOW so document.getElementById works inside tabs.js
+    el.appendChild(root);
+    try { new Function(TABS_JS).call(window); } catch (e) { console.error('tabs.js:', e); }
+    if (window.__projspecTabInit) window.__projspecTabInit(INITIAL_TAB);
+
+    // Handle _switch_tab messages from Python (neither lib nor fb handler catches these)
+    function onSwitchTab(raw) {
+        if (raw._switch_tab && window.__projspecShowTab) {
+            window.__projspecShowTab(raw._switch_tab);
+        }
+    }
+    model.on('msg:custom', onSwitchTab);
 
     return () => {
-        model.off('msg:custom', onHostMessage);
+        model.off('msg:custom', onLibMessage);
+        model.off('msg:custom', onFbMessage);
+        model.off('msg:custom', onSwitchTab);
         try { el.removeChild(root); } catch {}
     };
 }
 
-// AFM spec requires a default export; the named `render` export is
-// deprecated in anywidget ≥ 0.9.13 and not recognised by some hosts
-// (e.g. marimo).  Export both so the module satisfies current validators
-// while remaining backward-compatible with older anywidget runtimes.
 export default { render };
 """
 
 
-def _build_esm() -> str:
-    """Assemble the ESM module text, with the shared resources embedded.
+def _build_esm(initial_tab: str = "library") -> str:
+    """Assemble the combined ESM module with all resources embedded."""
+    from projspec.webui import get_combined_html, _panel_body_html, get_filebrowser_html
 
-    Each resource is JSON-encoded so the resulting module is a syntactically
-    valid JS string literal, which sidesteps any quoting issues with the
-    panel HTML / CSS / JS.
-    """
-    from projspec.webui import get_panel_html
-
-    # We only want the <body> inner HTML, not the full <html>...<body>
-    # envelope: the notebook already has one.  Ask the webui helper for a
-    # rendered document (icons resolved, no bootstrap, no extra head) and
-    # cut the body out.
-    icons = chrome_icons()
-    html = get_panel_html()
-    # Leave the CSS/JS out of the body: we embed them separately into the
-    # ESM so we control their execution order.  The rendered HTML has a
-    # `<style>...</style>` block (full CSS) and a `<script>...</script>`
-    # block (full JS) inside the body; strip both.
-    body_start = html.find("<body>")
-    body_end = html.rfind("</body>")
-    if body_start < 0 or body_end < 0:
-        raise RuntimeError("panel.html missing <body>..</body>")
-    body_inner = html[body_start + len("<body>") : body_end]
-    # get_panel_html emits <style>{css}</style> in <head>, but the body also
-    # ends with <script>{js}</script> - strip that.  We find the *last*
-    # <script>...</script> pair to avoid chewing on inline bootstrap JS
-    # (there's none here).
-    last_script = body_inner.rfind("<script>")
-    if last_script >= 0:
-        body_inner = (
-            body_inner[:last_script]
-            + body_inner[body_inner.find("</script>", last_script) + len("</script>") :]
-        )
+    panel_body = _panel_body_html()
+    fb_body = get_filebrowser_html(panel_body)
 
     return (
-        _ESM_TEMPLATE.replace("__PANEL_HTML_BODY__", json.dumps(body_inner))
+        _ESM_TEMPLATE.replace("__PANEL_HTML_BODY__", json.dumps(panel_body))
+        .replace("__FB_HTML_BODY__", json.dumps(fb_body))
         .replace("__PANEL_CSS__", json.dumps(get_panel_css()))
         .replace("__PANEL_JS__", json.dumps(get_panel_js()))
-        .replace("__CHROME_ICONS__", json.dumps(icons))
+        .replace("__FB_CSS__", json.dumps(get_filebrowser_css()))
+        .replace("__FB_JS__", json.dumps(get_filebrowser_js()))
+        .replace("__TABS_CSS__", json.dumps(get_tabs_css()))
+        .replace("__TABS_JS__", json.dumps(get_tabs_js()))
+        .replace("__CHROME_ICONS__", json.dumps(chrome_icons()))
+        .replace("__INITIAL_TAB__", json.dumps(initial_tab))
     )
 
 
@@ -182,14 +242,10 @@ def _build_esm() -> str:
 
 
 def _build_widget(library: "ProjectLibrary"):
-    """Construct the anywidget-backed DOMWidget for ``library``.
-
-    Import is deferred so :mod:`projspec.library` stays usable in
-    environments where :mod:`anywidget` is not installed.
-    """
+    """Construct the anywidget-backed DOMWidget for ``library``."""
     try:
         import anywidget
-    except ImportError as exc:  # pragma: no cover - optional dep
+    except ImportError as exc:  # pragma: no cover
         raise ImportError(
             "The ipywidget representation of ProjectLibrary requires the "
             "'anywidget' package.  Install it with "
@@ -198,20 +254,10 @@ def _build_widget(library: "ProjectLibrary"):
         ) from exc
 
     class ProjectLibraryWidget(anywidget.AnyWidget):
-        """Interactive ipywidget rendering of a :class:`ProjectLibrary`.
-
-        Mirrors the vsextension / qtapp UI: Library list on the left,
-        Details on the right.  Commands (add, reload, rescan, make, …)
-        are round-tripped to the Python kernel and modify the underlying
-        library in place.
-        """
+        """Combined Library + File Browser widget."""
 
         _esm = _build_esm()
-        # CSS is embedded in the ESM; anywidget ignores an empty _css.
         _css = ""
-
-        # No traitlets state: the widget exchanges messages via
-        # ``send`` / ``msg:custom`` instead of syncing a model attribute.
 
         def __init__(self, library_obj: "ProjectLibrary", **kwargs: Any):
             super().__init__(**kwargs)
@@ -220,92 +266,402 @@ def _build_widget(library: "ProjectLibrary"):
             self._enum_members: dict[str, Any] = {}
             self.on_msg(self._on_frontend_message)
 
-        # --- Inbound frontend -> Python ---------------------------------
+        # --- Routing --------------------------------------------------------
         def _on_frontend_message(
             self, _widget: Any, content: Any, _buffers: Any
         ) -> None:
             if not isinstance(content, dict):
                 return
-            cmd = content.get("cmd")
             try:
-                if cmd == "ready":
-                    self._send_initial_data()
-                elif cmd == "reload":
-                    self._reload()
-                elif cmd == "add":
-                    self._offer_add()
-                elif cmd == "addConfirmed":
-                    self._add_confirmed(
-                        content.get("path", ""),
-                        content.get("storageOptions", ""),
-                    )
-                elif cmd == "configure":
-                    _open_config_file(self._toast)
-                elif cmd == "rescan":
-                    self._rescan(content.get("url", ""))
-                elif cmd == "createSpec":
-                    self._offer_create_spec(content.get("url", ""))
-                elif cmd == "createSpecConfirmed":
-                    self._create_spec_confirmed(
-                        content.get("url", ""), content.get("spec", "")
-                    )
-                elif cmd == "removeFromLibrary":
-                    url = content.get("url", "")
-                    self._library.entries.pop(url, None)
-                    if self._library.auto_save:
-                        self._library.save()
-                    self._send_initial_data()
-                elif cmd == "make":
-                    self._make(
-                        content.get("url", ""),
-                        content.get("spec"),
-                        content.get("artifactType", ""),
-                        content.get("name"),
-                    )
-                elif cmd == "openWith":
-                    _open_with(
-                        content.get("tool", ""),
-                        content.get("url", ""),
-                        self._toast,
-                    )
-                elif cmd == "revealFile":
-                    _reveal_file(content.get("fn", ""), self._toast)
-                elif cmd == "copyToLocal":
-                    self._toast("Copy to local: not implemented")
-            except Exception as exc:  # log but never raise into the kernel
-                self._toast(f"{cmd}: {exc!r}")
+                if content.get("_fb"):
+                    # Strip the tag before dispatching
+                    msg = {k: v for k, v in content.items() if k != "_fb"}
+                    self._on_fb_message(msg)
+                else:
+                    self._on_lib_message(content)
+            except Exception as exc:
+                self._toast(f"{content.get('cmd')}: {exc!r}")
 
-        # --- Outbound Python -> frontend --------------------------------
-        def _send_initial_data(self) -> None:
+        # --- Library messages -----------------------------------------------
+        def _on_lib_message(self, content: dict) -> None:
+            cmd = content.get("cmd")
+            if cmd == "ready":
+                self._send_initial_data()
+            elif cmd == "reload":
+                self._reload()
+            elif cmd == "add":
+                self._offer_add()
+            elif cmd == "addConfirmed":
+                self._add_confirmed(
+                    content.get("path", ""), content.get("storageOptions", "")
+                )
+            elif cmd == "configure":
+                _open_config_file(self._toast)
+            elif cmd == "rescan":
+                self._rescan(content.get("url", ""))
+            elif cmd == "createSpec":
+                self._offer_create_spec(content.get("url", ""))
+            elif cmd == "createSpecConfirmed":
+                self._create_spec_confirmed(
+                    content.get("url", ""), content.get("spec", "")
+                )
+            elif cmd == "removeFromLibrary":
+                url = content.get("url", "")
+                self._library.entries.pop(url, None)
+                if self._library.auto_save:
+                    self._library.save()
+                self._send_initial_data()
+            elif cmd == "make":
+                self._make(
+                    content.get("url", ""),
+                    content.get("spec"),
+                    content.get("artifactType", ""),
+                    content.get("name"),
+                )
+            elif cmd == "openWith":
+                tool = content.get("tool", "")
+                url = content.get("url", "")
+                if tool == "filebrowser":
+                    # Switch to file browser tab and navigate there
+                    self.send({"_switch_tab": "filebrowser"})
+                    self.send(
+                        {
+                            "_fb": True,
+                            "type": "browseResult",
+                            "pushHistory": False,
+                            "storageOptions": "",
+                            **_fb_browse_data(url),
+                        }
+                    )
+                else:
+                    _open_with(tool, url, self._toast)
+            elif cmd == "revealFile":
+                _reveal_file(content.get("fn", ""), self._toast)
+            elif cmd == "copyToLocal":
+                self._toast("Copy to local: not implemented")
+
+        # --- Filebrowser messages -------------------------------------------
+        def _on_fb_message(self, content: dict) -> None:
+            import os
+
+            cmd = content.get("cmd")
+            if cmd == "ready":
+                self._fb_init()
+            elif cmd == "browse":
+                so = _parse_so(content.get("storageOptions"))
+                data = _fb_browse_data(content["url"], so)
+                self._fb_send(
+                    {
+                        "type": "browseResult",
+                        "pushHistory": content.get("push", True),
+                        "storageOptions": json.dumps(so) if so else "",
+                        **data,
+                    }
+                )
+            elif cmd == "inspect":
+                self._fb_inspect(
+                    content["url"], _parse_so(content.get("storageOptions"))
+                )
+            elif cmd == "scanDir":
+                self._fb_scan_dir(
+                    content["url"], _parse_so(content.get("storageOptions"))
+                )
+            elif cmd == "expandDir":
+                so = _parse_so(content.get("storageOptions"))
+                from projspec.filebrowser import browse
+
+                data = browse(content["url"], storage_options=so)
+                self._fb_send(
+                    {"type": "expandResult", "parentUrl": content["url"], **data}
+                )
+            elif cmd == "openFile":
+                self._fb_open_file(
+                    content["url"], _parse_so(content.get("storageOptions"))
+                )
+            elif cmd == "writeFile":
+                self._fb_write_file(
+                    content["url"],
+                    content["content"],
+                    _parse_so(content.get("storageOptions")),
+                )
+            elif cmd == "createFile":
+                self._fb_create_file(
+                    content["parentUrl"],
+                    content["name"],
+                    _parse_so(content.get("storageOptions")),
+                )
+            elif cmd == "deleteEntry":
+                self._fb_delete_entry(
+                    content["url"],
+                    content.get("isDir", False),
+                    _parse_so(content.get("storageOptions")),
+                )
+            elif cmd == "renameEntry":
+                self._fb_rename_entry(
+                    content["url"],
+                    content["newName"],
+                    _parse_so(content.get("storageOptions")),
+                )
+            elif cmd == "mkdir":
+                self._fb_mkdir(
+                    content["parentUrl"],
+                    content["name"],
+                    _parse_so(content.get("storageOptions")),
+                )
+            elif cmd == "addBookmark":
+                self._fb_bookmark_add(
+                    content["url"],
+                    content.get("label"),
+                    _parse_so(content.get("storageOptions")),
+                )
+            elif cmd == "removeBookmark":
+                self._fb_bookmark_remove(content["url"])
+            elif cmd == "addToLibrary":
+                self._fb_add_to_library(
+                    content["url"], _parse_so(content.get("storageOptions"))
+                )
+            elif cmd == "goToUrl":
+                so = _parse_so(content.get("storageOptions"))
+                from projspec.filebrowser import browse
+
+                data = browse(content["url"], storage_options=so)
+                self._fb_send(
+                    {
+                        "type": "browseResult",
+                        "pushHistory": True,
+                        "storageOptions": json.dumps(so) if so else "",
+                        **data,
+                    }
+                )
+
+        def _fb_send(self, msg: dict) -> None:
+            """Send a message to the filebrowser tab."""
+            self.send({**msg, "_fb": True})
+
+        def _fb_init(self) -> None:
+            import os
+            from projspec.filebrowser import bookmarks_list, supported_protocols
+
+            bms = bookmarks_list()
+            protos = supported_protocols()
+            lib_urls = list(self._library.entries.keys())
+            self._fb_send(
+                {
+                    "type": "init",
+                    "bookmarks": bms,
+                    "protocols": protos,
+                    "libraryUrls": lib_urls,
+                }
+            )
+            # Navigate to home
+            from projspec.filebrowser import browse
+
+            data = browse(os.path.expanduser("~"))
+            self._fb_send(
+                {
+                    "type": "browseResult",
+                    "pushHistory": False,
+                    "storageOptions": "",
+                    **data,
+                }
+            )
+
+        def _fb_inspect(self, url: str, so=None) -> None:
+            from projspec.filebrowser import inspect_as_project
+
+            data = inspect_as_project(url, storage_options=so)
+            self._fb_send({"type": "inspectResult", **data})
+            self._fb_send(
+                {
+                    "type": "projectScanned",
+                    "url": url,
+                    "project": data.get("project"),
+                    "error": data.get("error"),
+                    "text_preview": data.get("text_preview"),
+                    "info": self._info_data,
+                    "enums": self._enum_members,
+                }
+            )
+
+        def _fb_scan_dir(self, url: str, so=None) -> None:
+            from projspec.filebrowser import scan_directory
+
+            data = scan_directory(url, storage_options=so)
+            self._fb_send(
+                {
+                    "type": "projectScanned",
+                    "info": self._info_data,
+                    "enums": self._enum_members,
+                    **data,
+                }
+            )
+
+        def _fb_open_file(self, url: str, so=None) -> None:
+            import os, tempfile
+
+            local = _url_to_local(url)
+            if os.path.exists(local):
+                _open_with_default(local, self._toast)
+                return
+            from projspec.filebrowser import read_file
+
+            result = read_file(url, storage_options=so)
+            if result.get("error"):
+                self._toast(f"Open file: {result['error']}")
+                return
+            ext = os.path.splitext(url)[1] or ".txt"
+            tmp = tempfile.NamedTemporaryFile(
+                "w", suffix=ext, delete=False, encoding="utf-8"
+            )
+            tmp.write(result.get("content", ""))
+            tmp.close()
+            _open_with_default(tmp.name, self._toast)
+
+        def _fb_write_file(self, url: str, content: str, so=None) -> None:
+            from projspec.filebrowser import write_file, browse
+
+            result = write_file(url, content, storage_options=so)
+            if result.get("error"):
+                self._toast(f"Write: {result['error']}")
+                return
+            parent = url.rstrip("/").rsplit("/", 1)[0] or "/"
+            data = browse(parent, storage_options=so)
+            self._fb_send(
+                {
+                    "type": "browseResult",
+                    "pushHistory": False,
+                    "storageOptions": json.dumps(so) if so else "",
+                    **data,
+                }
+            )
+
+        def _fb_create_file(self, parent_url: str, name: str, so=None) -> None:
+            from projspec.filebrowser import write_file, browse
+
+            new_url = parent_url.rstrip("/") + "/" + name
+            result = write_file(new_url, "", storage_options=so)
+            if result.get("error"):
+                self._toast(f"Create: {result['error']}")
+                return
+            data = browse(parent_url, storage_options=so)
+            self._fb_send(
+                {
+                    "type": "browseResult",
+                    "pushHistory": False,
+                    "storageOptions": json.dumps(so) if so else "",
+                    **data,
+                }
+            )
+
+        def _fb_delete_entry(self, url: str, is_dir: bool, so=None) -> None:
+            from projspec.filebrowser import delete, browse
+
+            result = delete(url, storage_options=so, recursive=is_dir)
+            if result.get("error"):
+                self._toast(f"Delete: {result['error']}")
+                return
+            parent = url.rstrip("/").rsplit("/", 1)[0] or "/"
+            data = browse(parent, storage_options=so)
+            self._fb_send(
+                {
+                    "type": "browseResult",
+                    "pushHistory": False,
+                    "storageOptions": json.dumps(so) if so else "",
+                    **data,
+                }
+            )
+
+        def _fb_rename_entry(self, url: str, new_name: str, so=None) -> None:
+            from projspec.filebrowser import move, browse
+
+            parent = url.rstrip("/").rsplit("/", 1)[0] or "/"
+            dst = parent.rstrip("/") + "/" + new_name
+            result = move(url, dst, storage_options=so)
+            if result.get("error"):
+                self._toast(f"Rename: {result['error']}")
+                return
+            data = browse(parent, storage_options=so)
+            self._fb_send(
+                {
+                    "type": "browseResult",
+                    "pushHistory": False,
+                    "storageOptions": json.dumps(so) if so else "",
+                    **data,
+                }
+            )
+
+        def _fb_mkdir(self, parent_url: str, name: str, so=None) -> None:
+            from projspec.filebrowser import mkdir, browse
+
+            new_url = parent_url.rstrip("/") + "/" + name
+            result = mkdir(new_url, storage_options=so)
+            if result.get("error"):
+                self._toast(f"New folder: {result['error']}")
+                return
+            data = browse(parent_url, storage_options=so)
+            self._fb_send(
+                {
+                    "type": "browseResult",
+                    "pushHistory": False,
+                    "storageOptions": json.dumps(so) if so else "",
+                    **data,
+                }
+            )
+
+        def _fb_bookmark_add(self, url: str, label=None, so=None) -> None:
+            from projspec.filebrowser import bookmark_add
+
+            bms = bookmark_add(url, label=label or "", storage_options=so)
+            self._fb_send({"type": "bookmarksUpdated", "bookmarks": bms})
+
+        def _fb_bookmark_remove(self, url: str) -> None:
+            from projspec.filebrowser import bookmark_remove
+
+            bms = bookmark_remove(url)
+            self._fb_send({"type": "bookmarksUpdated", "bookmarks": bms})
+
+        def _fb_add_to_library(self, url: str, so=None) -> None:
+            from projspec.filebrowser import add_to_projspec_library
+
+            result = add_to_projspec_library(url, storage_options=so)
+            if result.get("error"):
+                self._toast(f"Add to library: {result['error']}")
+                return
+            self._toast(f"Added to library: {url}")
+            # Refresh filebrowser library badges
+            self._fb_send(
+                {
+                    "type": "libraryUrlsUpdated",
+                    "libraryUrls": list(self._library.entries.keys()),
+                }
+            )
+            # Reload library tab and select the new entry
+            self._send_initial_data(select_url=url)
+            # Tell the frontend to switch to the library tab
+            self.send({"_switch_tab": "library"})
+
+        # --- Outbound Python -> library frontend ----------------------------
+        def _send_initial_data(self, select_url: str | None = None) -> None:
             from projspec.utils import class_infos
 
             if not self._info_data:
                 self._info_data = class_infos()
                 self._enum_members = _collect_enum_members()
-
             lib_dict = {
                 url: proj.to_dict(compact=False)
                 for url, proj in self._library.entries.items()
             }
-            self.send(
-                {
-                    "type": "data",
-                    "info": self._info_data,
-                    "enums": self._enum_members,
-                    "library": lib_dict,
-                }
-            )
+            msg: dict = {
+                "type": "data",
+                "info": self._info_data,
+                "enums": self._enum_members,
+                "library": lib_dict,
+            }
+            if select_url:
+                msg["selectUrl"] = select_url
+            self.send(msg)
 
         def _reload(self) -> None:
-            """Re-read the on-disk library, but only when doing so won't
-            destroy in-memory state.
-
-            ``ProjectLibrary.load()`` resets ``self.entries = {}`` when the
-            backing file is missing, which would wipe an in-memory-only
-            library (the common case when the widget is driven from user
-            code, e.g. ``library.add_entry(...)`` in a cell).  We only
-            reload from disk when a backing file actually exists.
-            """
             import os
 
             path = self._library.path
@@ -317,18 +673,10 @@ def _build_widget(library: "ProjectLibrary"):
             self.send({"type": "loading", "loading": bool(busy)})
 
         def _toast(self, message: str) -> None:
-            """Surface a short status message to the user.
-
-            In a notebook we just print so the message lands in the cell
-            output; we deliberately do not raise.  The Qt app uses a modal
-            dialog here; the widget has no equivalent without more JS.
-            """
             print(f"[projspec] {message}")
 
-        # --- Action helpers --------------------------------------------
+        # --- Action helpers (library) --------------------------------------
         def _offer_add(self) -> None:
-            """Ask the frontend to open the text-entry modal for a new
-            project path."""
             self.send({"type": "openAddModal"})
 
         def _add_confirmed(self, path: str, storage_options: str = "") -> None:
@@ -363,25 +711,6 @@ def _build_widget(library: "ProjectLibrary"):
                 self._set_busy(False)
 
         def _resolve_entry_path(self, url: str) -> str | None:
-            """Return the path used to re-open the library entry *url*.
-
-            The path must keep its protocol so remote projects (``memory://``,
-            ``s3://``, …) re-open against the right filesystem.  We prefer the
-            library key *url* when it already carries a protocol - it is the
-            authoritative, protocol-qualified identifier the UI holds, and is
-            reliable even when an older serialised library reconstructed the
-            entry's filesystem as local.  Otherwise we use the stored project's
-            protocol-qualified URL (``fs.unstrip_protocol(proj.url)``), since
-            ``proj.path``/``proj.url`` have the protocol stripped by
-            ``fsspec.url_to_fs`` (e.g. ``/proj`` for ``memory://proj``) and a
-            bare path would resolve against the *local* filesystem.
-
-            The library key is otherwise an opaque identity used by the UI;
-            reusing it as a path breaks for entries keyed on a basename or
-            relative sub-path (e.g. walked children added under the library
-            root), so we only fall back to ``_url_to_local`` when there is no
-            matching entry.
-            """
             if url and "://" in url:
                 return url
             proj = self._library.entries.get(url)
@@ -390,32 +719,13 @@ def _build_widget(library: "ProjectLibrary"):
                     return proj.fs.unstrip_protocol(proj.url)
                 except Exception:
                     return proj.path
-            # Fall back to the URL, minus any ``file://`` scheme prefix, so
-            # the caller still gets *something* usable when there is no
-            # matching entry (e.g., the UI is about to create one).
             return _url_to_local(url) if url else None
 
         def _entry_storage_options(self, url: str) -> dict:
-            """Storage options stored on the library entry *url* (or ``{}``).
-
-            Remote projects (s3://, gcs://, authenticated http, …) need their
-            ``storage_options`` to be re-supplied when reconstructing the
-            ``Project`` on rescan, otherwise the filesystem access fails.
-            """
             proj = self._library.entries.get(url)
             return dict(getattr(proj, "storage_options", None) or {})
 
         def _rescan(self, url: str) -> None:
-            """Re-run ``Project(...)`` for the entry *url* and replace it.
-
-            The library key is preserved verbatim so the UI's identity for
-            the entry does not drift (the JS selection state is keyed on
-            that url).  Crucially, the *path* used for the new ``Project``
-            is taken from the stored entry's ``proj.path`` - not from the
-            library key - because library keys may be opaque identifiers
-            (e.g. a walked child's basename) that would resolve against
-            the kernel's cwd if passed to ``Project(...)``.
-            """
             import projspec
 
             if not url:
@@ -427,12 +737,8 @@ def _build_widget(library: "ProjectLibrary"):
             self._set_busy(True)
             try:
                 proj = projspec.Project(
-                    path,
-                    walk=False,
-                    storage_options=self._entry_storage_options(url),
+                    path, walk=False, storage_options=self._entry_storage_options(url)
                 )
-                # Keep the *original* library key so we don't duplicate the
-                # entry under a different protocol prefix.
                 self._library.entries[url] = proj
                 if self._library.auto_save:
                     self._library.save()
@@ -468,7 +774,6 @@ def _build_widget(library: "ProjectLibrary"):
                 proj = projspec.Project(path, walk=False, storage_options=so)
                 proj.create(spec)
                 fresh = projspec.Project(path, walk=False, storage_options=so)
-                # Same key-preservation rule as _rescan.
                 self._library.entries[url] = fresh
                 if self._library.auto_save:
                     self._library.save()
@@ -477,34 +782,21 @@ def _build_widget(library: "ProjectLibrary"):
                 self._set_busy(False)
 
         def _make(
-            self,
-            url: str,
-            spec: str | None,
-            artifact_type: str,
-            name: str | None,
+            self, url: str, spec: str | None, artifact_type: str, name: str | None
         ) -> None:
+            import os
+
             qname = ".".join(p for p in (spec, artifact_type, name) if p)
             proj = self._library.entries.get(url)
             if proj is None:
                 self._toast(f"Project not found: {url}")
                 return
-            # Guard against a Project whose stored ``path`` is not absolute
-            # (possible for library entries that were keyed under a walked
-            # child's basename pre-fix).  Artifacts launch subprocesses with
-            # ``cwd=self.proj.path``; a relative cwd would resolve against
-            # the kernel's working directory - i.e. the notebook's launch
-            # directory - instead of the project's own location.  Absolutize
-            # against the library key (which, for entries added via the
-            # widget, is the project's ``unstrip_protocol(url)``).
-            import os
-
             if proj.path and not os.path.isabs(proj.path):
                 fallback = _url_to_local(url)
                 if os.path.isabs(fallback):
                     proj.path = fallback
                 else:
                     proj.path = os.path.abspath(proj.path)
-                # Keep proj.url in sync so any fs.ls() calls still work.
                 proj.url = proj.path
             self._set_busy(True)
             try:
@@ -524,6 +816,27 @@ def _build_widget(library: "ProjectLibrary"):
 # *has* a meaningful effect in a notebook kernel is implemented here; the
 # few that cannot (picking a folder with a native dialog, opening a modal
 # dialog, etc.) are handled via additional frontend messages above.
+
+
+def _parse_so(storage_options) -> dict | None:
+    """Parse a storage_options value that may be a JSON string, dict, or None."""
+    if not storage_options:
+        return None
+    if isinstance(storage_options, dict):
+        return storage_options or None
+    if isinstance(storage_options, str):
+        try:
+            return json.loads(storage_options) or None
+        except Exception:
+            return None
+    return None
+
+
+def _fb_browse_data(url: str, so: dict | None = None) -> dict:
+    """Return browse() result dict for a URL."""
+    from projspec.filebrowser import browse
+
+    return browse(url, storage_options=so)
 
 
 def _url_to_local(url: str) -> str:
@@ -573,19 +886,7 @@ def _open_with_default(path: str, toast) -> None:
 
 
 def _open_with(tool: str, url: str, toast) -> None:
-    """Dispatch the *Open with …* kebab-menu choices.
-
-    Supported tools match the other projspec UIs:
-
-    ``vscode``
-        ``code <path>``
-    ``filebrowser``
-        OS file manager (``xdg-open`` / ``open`` / Explorer)
-    ``pycharm``
-        ``pycharm <path> nosplash dontReopenProjects``
-    ``jupyter``
-        ``jupyter lab <path>``
-    """
+    """Dispatch the *Open with …* kebab-menu choices."""
     local = _url_to_local(url)
     if tool == "vscode":
         _spawn_detached(["code", local], toast)

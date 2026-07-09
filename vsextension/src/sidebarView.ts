@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
 
 /**
- * Simple sidebar view that provides a button to launch the main Project
- * Library webview panel.  Keeping this view lightweight (just a command
- * trigger) leaves the full two-panel UI to be rendered in a roomy editor-area
- * WebviewPanel, as described in ACTIONS.md.
+ * Simple sidebar view that provides buttons to launch the main Project
+ * Library webview panel and the File Browser.  Keeping this view lightweight
+ * (just command triggers) leaves the full UIs to be rendered in roomy
+ * editor-area WebviewPanels, as described in ACTIONS.md.
  */
 export class SidebarViewProvider implements vscode.WebviewViewProvider {
     constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -14,7 +14,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this.getHtml();
         webviewView.webview.onDidReceiveMessage((msg) => {
             if (msg.cmd === 'open') {
+                // Opens combined panel on the Library tab
                 vscode.commands.executeCommand('projspec.showTree');
+            } else if (msg.cmd === 'openFileBrowser') {
+                // Opens combined panel on the File Browser tab
+                vscode.commands.executeCommand('projspec.openFileBrowserHere');
             }
         });
     }
@@ -36,8 +40,15 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         border-radius: 3px;
         font-size: 13px;
         width: 100%;
+        margin-bottom: 8px;
     }
     button:hover { background: var(--vscode-button-hoverBackground); }
+    button.secondary {
+        background: var(--vscode-button-secondaryBackground, transparent);
+        color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+        border: 1px solid var(--vscode-panel-border);
+    }
+    button.secondary:hover { background: var(--vscode-toolbar-hoverBackground); }
     p { color: var(--vscode-descriptionForeground); font-size: 12px; }
 </style>
 </head>
@@ -45,6 +56,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     <p>projspec manages a library of projects, scans directories for known
     project types, and can build/run their artifacts.</p>
     <button onclick="acquireVsCodeApi().postMessage({cmd:'open'})">Open Project Library</button>
+    <button class="secondary" onclick="acquireVsCodeApi().postMessage({cmd:'openFileBrowser'})">&#128193; Open File Browser</button>
 </body>
 </html>`;
     }

@@ -53,9 +53,11 @@ try:
         ListItem,
         ListView,
         Static,
+        TabbedContent,
+        TabPane,
     )
 except ImportError as e:
-    warnings.warn("Texutal is required for the TUI")
+    warnings.warn("Textual is required for the TUI")
     App = None
 
 
@@ -348,7 +350,7 @@ class KebabMenuModal(ModalScreen[str | None]):
         if self._is_local:
             items = [
                 ("openVSCode", "Open with VSCode"),
-                ("openFilebrowser", "Open with system filebrowser"),
+                ("openFilebrowser", "Show in file browser"),
                 ("openPyCharm", "Open with PyCharm"),
                 ("openJupyter", "Open with jupyter"),
                 ("_sep", ""),
@@ -968,6 +970,7 @@ def _expand_glob(pattern: str) -> list[str]:
 APP_CSS = """
 Screen { background: #1e1e1e; }
 
+/* ── Library tab ──────────────────────────────────────────────────────── */
 #library-pane {
     width: 2fr; min-width: 40;
     border-right: solid #3c3c3c;
@@ -988,12 +991,212 @@ Screen { background: #1e1e1e; }
 
 #details-list { padding: 1; }
 
+/* ── File browser tab ─────────────────────────────────────────────────── */
+#fb-url-row { height: 3; padding: 0 1; background: #252526; border-bottom: solid #3c3c3c; }
+#fb-url-row Input { width: 1fr; }
+#fb-url-row Button { min-width: 6; margin-left: 1; }
+
+#fb-toolbar { height: 3; padding: 0 1; background: #252526; border-bottom: solid #3c3c3c; }
+#fb-toolbar Button { margin-right: 1; min-width: 8; }
+
+#fb-entries-pane { width: 2fr; min-width: 36; border-right: solid #3c3c3c; padding: 0 1; }
+#fb-info-pane    { width: 3fr; padding: 1; }
+#fb-info-title   { color: #4fc1ff; text-style: bold; }
+#fb-info-body    { color: #858585; }
+
+/* ── Status bar ───────────────────────────────────────────────────────── */
 #status { dock: bottom; height: 1; background: #007acc; color: white; padding: 0 1; }
 """
 
 
+# ---------------------------------------------------------------------------
+#  File browser entry widget
+# ---------------------------------------------------------------------------
+
+
+class FbEntry(Static):
+    """One row in the file browser listing.
+
+    A single click selects the entry; two clicks within 500 ms on a
+    directory navigate into it (Textual has no native double-click event,
+    so we implement it via click-time tracking).
+    """
+
+    COMPONENT_CLASSES = {"fb-entry--dir", "fb-entry--file"}
+
+    class Selected(Message):
+        def __init__(self, url: str, entry_type: str) -> None:
+            super().__init__()
+            self.url = url
+            self.entry_type = entry_type
+
+    class NavigateTo(Message):
+        def __init__(self, url: str) -> None:
+            super().__init__()
+            self.url = url
+
+    def __init__(self, entry: dict) -> None:
+        self._entry = entry
+        self._url = entry.get("name", "")
+        self._type = entry.get("type", "file")
+        name = (
+            entry.get("basename")
+            or self._url.rstrip("/").rsplit("/", 1)[-1]
+            or self._url
+        )
+        icon = "📁" if self._type == "directory" else "📄"
+        label = f"{icon} {name}"
+        super().__init__(label)
+        self._last_click: float = 0.0
+
+    def on_click(self) -> None:
+        import time
+
+        now = time.monotonic()
+        if self._type == "directory" and (now - self._last_click) < 0.5:
+            # Two clicks within 500 ms → navigate
+            self._last_click = 0.0
+            self.post_message(FbEntry.NavigateTo(self._url))
+        else:
+            self._last_click = now
+            self.post_message(FbEntry.Selected(self._url, self._type))
+
+
+class StorageOptionsModal(ModalScreen[str | None]):
+    """Edit the current storage-options JSON string.
+
+    Returns the new JSON string (possibly empty) or ``None`` if cancelled.
+    """
+
+    DEFAULT_CSS = """
+    StorageOptionsModal { align: center middle; }
+    #so-box {
+        background: #252526; border: solid #454545;
+        padding: 1 2; width: 70; height: auto;
+    }
+    #so-hint { color: #858585; margin-bottom: 1; }
+    #so-btn-row { margin-top: 1; height: 3; }
+    #so-btn-row Button { margin-right: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "app.pop_screen()", "Cancel")]
+
+    def __init__(self, current: str = "") -> None:
+        super().__init__()
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="so-box"):
+            yield Label(
+                "Storage options (JSON) — fsspec credentials / endpoint "
+                'overrides, e.g. {"key":"AKIA…","secret":"…"}. '
+                "Leave blank for public / local access.",
+                id="so-hint",
+            )
+            yield Input(
+                value=self._current,
+                placeholder='{"key": "…", "secret": "…"}',
+                id="so-input",
+            )
+            with Horizontal(id="so-btn-row"):
+                yield Button("Apply", variant="primary", id="so-ok")
+                yield Button("Cancel", id="so-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#so-input", Input).focus()
+
+    @on(Input.Submitted, "#so-input")
+    def _on_submitted(self) -> None:
+        self._apply()
+
+    @on(Button.Pressed, "#so-ok")
+    def _on_ok(self) -> None:
+        self._apply()
+
+    @on(Button.Pressed, "#so-cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _apply(self) -> None:
+        value = self.query_one("#so-input", Input).value.strip()
+        if value:
+            import json as _json
+
+            try:
+                _json.loads(value)
+            except ValueError:
+                self.query_one("#so-hint", Label).update(
+                    "[red]Invalid JSON — please correct it.[/red]"
+                )
+                return
+        self.dismiss(value)
+
+
+class BookmarksModal(ModalScreen[dict | None]):
+    """Show saved bookmarks and let the user navigate to one or remove it.
+
+    Returns the URL to navigate to, or ``None`` if closed without selection.
+    """
+
+    DEFAULT_CSS = """
+    BookmarksModal { align: center middle; }
+    #bm-box {
+        background: #252526; border: solid #454545;
+        padding: 1 2; width: 70; height: auto; max-height: 30;
+    }
+    #bm-title { text-style: bold; margin-bottom: 1; }
+    #bm-list  { height: auto; max-height: 20; }
+    #bm-empty { color: #858585; }
+    #bm-btn-row { margin-top: 1; height: 3; }
+    #bm-btn-row Button { margin-right: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "app.pop_screen()", "Close")]
+
+    def __init__(self, bookmarks: list[dict], current_url: str = "") -> None:
+        super().__init__()
+        self._bookmarks = bookmarks
+        self._current_url = current_url
+        # Map safe widget id → full bookmark dict (URLs can't be used as
+        # Textual widget ids — they contain "://", ".", "/" etc.)
+        self._idx_to_bm: dict[str, dict] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="bm-box"):
+            yield Label("★ Bookmarks", id="bm-title")
+            with VerticalScroll(id="bm-list"):
+                if not self._bookmarks:
+                    yield Label("No bookmarks yet.", id="bm-empty")
+                else:
+                    for i, bm in enumerate(self._bookmarks):
+                        url = bm.get("url", "")
+                        label = bm.get("label") or url
+                        wid = f"bm-item-{i}"
+                        self._idx_to_bm[wid] = bm
+                        yield Button(label, id=wid, classes="bm-item")
+            with Horizontal(id="bm-btn-row"):
+                yield Button("+ Bookmark current", variant="primary", id="bm-add")
+                yield Button("Close", id="bm-close")
+
+    def on_mount(self) -> None:
+        items = self.query(".bm-item")
+        if items:
+            items.first().focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "bm-close":
+            self.dismiss(None)
+        elif bid == "bm-add":
+            # Return a synthetic bookmark dict for the current location
+            self.dismiss({"url": self._current_url, "_add": True})
+        elif bid in self._idx_to_bm:
+            self.dismiss(self._idx_to_bm[bid])
+        event.stop()
+
+
 class ProjspecApp(App):
-    """Projspec terminal browser - two-pane library + details UI."""
+    """Projspec terminal browser — Project Library + File Browser tabs."""
 
     TITLE = "Projspec Browser"
     CSS = APP_CSS
@@ -1003,6 +1206,7 @@ class ProjspecApp(App):
         Binding("r", "reload", "Reload"),
         Binding("a", "add", "Add"),
         Binding("/", "focus_search", "Search"),
+        Binding("f", "focus_fb_url", "FB URL", show=False),
     ]
 
     status_message: reactive[str] = reactive("Ready", init=False)
@@ -1013,42 +1217,74 @@ class ProjspecApp(App):
         self._enums: dict[str, dict[str, Any]] = {}
         self._selection: tuple[str, str, str | None] | None = None
         self._busy = 0
+        self._fb_current_url: str = ""
+        self._fb_selected_url: str = ""
+        self._fb_selected_type: str = ""
+        self._fb_storage_options: str = ""  # current SO JSON string (empty = none)
+        self._fb_bookmarks: list[dict] = []  # cached from filebrowser.bookmarks_list()
 
-    # ── Layout ─────────────────────────────────────────────────────────────
+    # ── Layout ──────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Horizontal():
-            with Vertical(id="library-pane"):
-                with Horizontal(id="toolbar"):
-                    yield Button(
-                        f"{CHROME_ICONS['add']} Add",
-                        id="btn-add",
-                        variant="primary",
-                    )
-                    yield Button(f"{CHROME_ICONS['reload']} Reload", id="btn-reload")
-                    yield Button(
-                        f"{CHROME_ICONS['configure']} Configure",
-                        id="btn-configure",
-                    )
-                with Horizontal(id="search-row"):
-                    yield Input(placeholder="Search projects", id="search")
-                    btn_clear = Button(
-                        CHROME_ICONS["clear"], id="btn-clear", variant="default"
-                    )
-                    btn_clear.tooltip = "Clear search"
-                    yield btn_clear
-                yield VerticalScroll(id="projects")
-            with Vertical(id="details-pane"):
-                with Vertical(id="details-header"):
-                    yield Static("Details", id="details-title")
-                    yield Static("", id="details-doc")
-                yield VerticalScroll(id="details-list")
+        with TabbedContent(initial="tab-library"):
+            # ── Project Library tab ─────────────────────────────────────
+            with TabPane("📚 Project Library", id="tab-library"):
+                with Horizontal():
+                    with Vertical(id="library-pane"):
+                        with Horizontal(id="toolbar"):
+                            yield Button(
+                                f"{CHROME_ICONS['add']} Add",
+                                id="btn-add",
+                                variant="primary",
+                            )
+                            yield Button(
+                                f"{CHROME_ICONS['reload']} Reload", id="btn-reload"
+                            )
+                            yield Button(
+                                f"{CHROME_ICONS['configure']} Configure",
+                                id="btn-configure",
+                            )
+                        with Horizontal(id="search-row"):
+                            yield Input(placeholder="Search projects", id="search")
+                            btn_clear = Button(
+                                CHROME_ICONS["clear"], id="btn-clear", variant="default"
+                            )
+                            btn_clear.tooltip = "Clear search"
+                            yield btn_clear
+                        yield VerticalScroll(id="projects")
+                    with Vertical(id="details-pane"):
+                        with Vertical(id="details-header"):
+                            yield Static("Details", id="details-title")
+                            yield Static("", id="details-doc")
+                        yield VerticalScroll(id="details-list")
+            # ── File Browser tab ─────────────────────────────────────────
+            with TabPane("📁 File Browser", id="tab-filebrowser"):
+                with Vertical():
+                    with Horizontal(id="fb-toolbar"):
+                        yield Button("⬆ Up", id="btn-fb-up", variant="default")
+                        yield Button(
+                            "↻ Refresh", id="btn-fb-refresh", variant="default"
+                        )
+                        yield Button("★ Bookmarks", id="btn-fb-bm", variant="default")
+                        yield Button("🔑 SO", id="btn-fb-so", variant="default")
+                        yield Button("+ Lib", id="btn-fb-add-lib", variant="primary")
+                    with Horizontal(id="fb-url-row"):
+                        yield Input(placeholder="Path or URL", id="fb-url-input")
+                        yield Button("Go", id="btn-fb-go", variant="primary")
+                    with Horizontal():
+                        yield VerticalScroll(id="fb-entries-pane")
+                        with Vertical(id="fb-info-pane"):
+                            yield Static("No selection", id="fb-info-title")
+                            yield Static("", id="fb-info-body")
         yield Static(self.status_message, id="status")
         yield Footer()
 
     def on_mount(self) -> None:
         self._reload(initial=True)
+        # Load bookmarks then kick off the file browser at the home directory
+        self._fb_load_bookmarks()
+        self._fb_navigate(os.path.expanduser("~"))
 
     def watch_status_message(self, msg: str) -> None:
         try:
@@ -1086,6 +1322,230 @@ class ProjspecApp(App):
             self.query_one("#search", Input).focus()
         except Exception:
             pass
+
+    def action_focus_fb_url(self) -> None:
+        try:
+            self.query_one("#fb-url-input", Input).focus()
+        except Exception:
+            pass
+
+    # ── File browser button handlers ────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-fb-go")
+    def _on_fb_go(self) -> None:
+        try:
+            url = self.query_one("#fb-url-input", Input).value.strip()
+            if url:
+                self._fb_navigate(url)
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#btn-fb-up")
+    def _on_fb_up(self) -> None:
+        if self._fb_current_url:
+            parent = _url_to_parent(self._fb_current_url)
+            if parent and parent != self._fb_current_url:
+                self._fb_navigate(parent)
+
+    @on(Button.Pressed, "#btn-fb-refresh")
+    def _on_fb_refresh(self) -> None:
+        if self._fb_current_url:
+            self._fb_navigate(self._fb_current_url)
+
+    @on(Button.Pressed, "#btn-fb-so")
+    def _on_fb_so(self) -> None:
+        """Open the storage-options modal."""
+
+        def _cb(result: str | None) -> None:
+            if result is not None:
+                self._fb_storage_options = result
+                so_label = " [🔑]" if result else ""
+                self.status_message = f"Storage options set{so_label}"
+
+        self.push_screen(StorageOptionsModal(self._fb_storage_options), _cb)
+
+    @on(Button.Pressed, "#btn-fb-bm")
+    def _on_fb_bm(self) -> None:
+        """Open the bookmarks modal."""
+
+        def _cb(result: dict | None) -> None:
+            if not result:
+                return
+            url = result.get("url", "")
+            if not url:
+                return
+            if result.get("_add"):
+                # Save current location as a bookmark
+                self._fb_bookmark_add(url)
+                return
+            # Apply the bookmark's stored storage_options to the session SO,
+            # then navigate.  This is the key step: without it, credentials
+            # stored on the bookmark are silently ignored.
+            bm_so = result.get("storage_options") or {}
+            if bm_so:
+                self._fb_storage_options = json.dumps(bm_so)
+            self._fb_navigate(url)
+
+        self.push_screen(BookmarksModal(self._fb_bookmarks, self._fb_current_url), _cb)
+
+    @on(Button.Pressed, "#btn-fb-add-lib")
+    def _on_fb_add_lib(self) -> None:
+        if self._fb_selected_url and self._fb_selected_type == "directory":
+            self._fb_add_to_library(self._fb_selected_url)
+
+    @on(FbEntry.Selected)
+    def _on_fb_entry_selected(self, event: "FbEntry.Selected") -> None:
+        self._fb_selected_url = event.url
+        self._fb_selected_type = event.entry_type
+        self._fb_show_info(event.url, event.entry_type)
+        event.stop()
+
+    @on(FbEntry.NavigateTo)
+    def _on_fb_navigate_to(self, event: "FbEntry.NavigateTo") -> None:
+        self._fb_navigate(event.url)
+        event.stop()
+
+    # ── File browser core logic ──────────────────────────────────────────────
+
+    def _fb_load_bookmarks(self) -> None:
+        try:
+            from projspec.filebrowser import bookmarks_list
+
+            self._fb_bookmarks = bookmarks_list()
+        except Exception:
+            self._fb_bookmarks = []
+
+    def _fb_so_dict(self) -> dict | None:
+        """Parse ``self._fb_storage_options`` and return a dict, or None."""
+        so_str = self._fb_storage_options
+        if not so_str:
+            return None
+        try:
+            import json as _json
+
+            return _json.loads(so_str) or None
+        except Exception:
+            return None
+
+    def _fb_navigate(self, url: str) -> None:
+        from projspec.filebrowser import browse
+
+        self._set_busy(True)
+        try:
+            so = self._fb_so_dict()
+            result = browse(url, storage_options=so)
+            if result.get("error"):
+                # Show the full diagnostic in the info pane where it's always visible
+                try:
+                    self.query_one("#fb-info-title", Static).update("Browse error")
+                    self.query_one("#fb-info-body", Static).update(
+                        f"URL: {url!r}\nSO: {so!r}\nError: {result['error']}"
+                    )
+                except Exception:
+                    pass
+                return
+            self._fb_current_url = result.get("url", url)
+            try:
+                self.query_one("#fb-url-input", Input).value = self._fb_current_url
+            except Exception:
+                pass
+            entries_pane = self.query_one("#fb-entries-pane", VerticalScroll)
+            for child in list(entries_pane.children):
+                child.remove()
+            entries = result.get("entries", [])
+            if not entries:
+                entries_pane.mount(Static("(empty)", classes="url"))
+            else:
+                for entry in entries:
+                    entries_pane.mount(FbEntry(entry))
+            try:
+                self.query_one("#fb-info-title", Static).update("No selection")
+                self.query_one("#fb-info-body", Static).update("")
+            except Exception:
+                pass
+            self._fb_selected_url = ""
+            self._fb_selected_type = ""
+            so_indicator = " [🔑]" if self._fb_storage_options else ""
+            self.status_message = f"📁 {self._fb_current_url}{so_indicator}"
+        except Exception as e:
+            try:
+                self.query_one("#fb-info-title", Static).update("Browse exception")
+                self.query_one("#fb-info-body", Static).update(
+                    f"URL: {url!r}\nSO: {self._fb_so_dict()!r}\nException: {e}"
+                )
+            except Exception:
+                pass
+        finally:
+            self._set_busy(False)
+
+    def _fb_show_info(self, url: str, entry_type: str) -> None:
+        name = url.rstrip("/").rsplit("/", 1)[-1] or url
+        so = self._fb_so_dict()
+        try:
+            info_title = self.query_one("#fb-info-title", Static)
+            info_body = self.query_one("#fb-info-body", Static)
+            if entry_type == "directory":
+                info_title.update(f"📁 {name}")
+                from projspec.filebrowser import scan_directory
+
+                result = scan_directory(url, storage_options=so)
+                proj = result.get("project")
+                if proj and proj.get("specs"):
+                    spec_names = ", ".join(proj["specs"].keys())
+                    info_body.update(f"Specs: {spec_names}")
+                else:
+                    info_body.update("(no projspec data)")
+            else:
+                from projspec.filebrowser import inspect_file
+
+                result = inspect_file(url, storage_options=so)
+                mime = result.get("mime_type", "")
+                size = result.get("size")
+                parts = []
+                if mime:
+                    parts.append(mime)
+                if size is not None:
+                    parts.append(_fmt_size(size))
+                preview = result.get("text_preview", "")
+                if preview:
+                    parts.append("\n" + preview[:200])
+                info_title.update(f"📄 {name}")
+                info_body.update("\n".join(parts) if parts else "(no info)")
+        except Exception as e:
+            try:
+                self.query_one("#fb-info-body", Static).update(f"Error: {e}")
+            except Exception:
+                pass
+
+    def _fb_add_to_library(self, url: str) -> None:
+        from projspec.filebrowser import add_to_projspec_library
+
+        self._set_busy(True)
+        try:
+            result = add_to_projspec_library(url, storage_options=self._fb_so_dict())
+            if result.get("error"):
+                self.status_message = f"Add to library failed: {result['error']}"
+            else:
+                self.status_message = f"Added to library: {url}"
+                self._reload()
+                try:
+                    self.query_one(TabbedContent).active = "tab-library"
+                except Exception:
+                    pass
+        except Exception as e:
+            self.status_message = f"Add to library failed: {e}"
+        finally:
+            self._set_busy(False)
+
+    def _fb_bookmark_add(self, url: str) -> None:
+        """Bookmark *url* and refresh the cached list."""
+        try:
+            from projspec.filebrowser import bookmark_add
+
+            self._fb_bookmarks = bookmark_add(url, storage_options=self._fb_so_dict())
+            self.status_message = f"Bookmarked: {url}"
+        except Exception as e:
+            self.status_message = f"Bookmark failed: {e}"
 
     @on(Button.Pressed, "#btn-add")
     def _on_add(self) -> None:
@@ -1349,7 +1809,12 @@ class ProjspecApp(App):
             if key == "openVSCode":
                 _spawn_detached(["code", _url_to_local(url)])
             elif key == "openFilebrowser":
-                _open_default(_url_to_local(url))
+                # Switch to the File Browser tab and navigate there
+                try:
+                    self.query_one(TabbedContent).active = "tab-filebrowser"
+                except Exception:
+                    pass
+                self._fb_navigate(url)
             elif key == "openPyCharm":
                 _spawn_detached(
                     [
@@ -1467,6 +1932,33 @@ class ProjspecApp(App):
         entry = table.get(klass) or {}
         doc = entry.get("doc") or "(no documentation)"
         self.push_screen(InfoPopupModal(klass, doc))
+
+
+def _url_to_parent(url: str) -> str:
+    """Return the parent directory of *url*."""
+    s = url.rstrip("/")
+    proto_end = s.find("://")
+    if proto_end >= 0:
+        path_part = s[proto_end + 3 :]
+        slash = path_part.rfind("/")
+        if slash <= 0:
+            return s[: proto_end + 3] or s
+        return s[: proto_end + 3 + slash]
+    slash = s.rfind("/")
+    return s[:slash] if slash > 0 else "/"
+
+
+def _fmt_size(n) -> str:
+    """Human-readable file size."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
 
 
 # ---------------------------------------------------------------------------
