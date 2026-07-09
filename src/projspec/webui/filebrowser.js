@@ -38,15 +38,9 @@
     };
 
     // ── debug log ─────────────────────────────────────────────────────────
-    const debugEl = $fbId('fb-debug');
     function dbg(msg) {
-        if (debugEl) {
-            const line = document.createElement('div');
-            line.textContent = '[' + new Date().toISOString().slice(11,23) + '] ' + msg;
-            debugEl.appendChild(line);
-            debugEl.scrollTop = debugEl.scrollHeight;
-        }
         console.log('[fb] ' + msg);
+        _transport.send({ cmd: 'log', msg: msg });
     }
     dbg('script started');
 

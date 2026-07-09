@@ -285,7 +285,7 @@ class ProjspecToolWindowPanel(
         val cmd = msg["cmd"] as? String
         val url = msg["url"] as? String ?: msg["parentUrl"] as? String ?: ""
         val so  = msg["storageOptions"] as? String
-        PluginLogger.info("FB cmd=$cmd url=$url so=${so?.take(80) ?: "null"}")
+        if (cmd != "log") PluginLogger.info("FB cmd=$cmd url=$url so=${so?.take(80) ?: "null"}")
         when (cmd) {
             "ready"        -> pool { fbInit() }
             "browse"       -> pool { fbBrowse(msg["url"] as? String ?: "", so,
