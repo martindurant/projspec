@@ -14,6 +14,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.ui.jcef.JBCefBrowser
+import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.projspec.settings.ProjspecSettings
 import com.projspec.util.CliResult
@@ -58,9 +59,9 @@ class ProjspecToolWindowPanel(
     private val gson = Gson()
     private val browser: JBCefBrowser = JBCefBrowser()
     /** Library-panel bridge (window.__javaBridge) */
-    private val jsQuery: JBCefJSQuery = JBCefJSQuery.create(browser)
+    private val jsQuery: JBCefJSQuery = JBCefJSQuery.create(browser as JBCefBrowserBase)
     /** File-browser bridge (window.__javaFbBridge) */
-    private val fbJsQuery: JBCefJSQuery = JBCefJSQuery.create(browser)
+    private val fbJsQuery: JBCefJSQuery = JBCefJSQuery.create(browser as JBCefBrowserBase)
 
     /** HTTP server — started off-EDT alongside the HTML build. */
     private val server = ProjspecServer()
